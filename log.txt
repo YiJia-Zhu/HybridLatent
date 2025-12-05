@@ -1,0 +1,115 @@
+============================================================
+EVALUATION RESULTS: gsm8k
+============================================================
+Accuracy: 55.72% (735/1319)
+
+Token Distribution:                                                                                                                                                                                                                                                   "aiseon" 17:28 05-12月-25
+  Total tokens: 18715
+  Normal mode: 0 (0.0%)
+  Latent mode:   18715 (100.0%)
+
+Time Statistics:
+  Normal mode avg: 0.000 ms/step
+  Latent mode avg:   28.418 ms/step
+  Normal total:    0.00 s (0 steps)
+  Latent total:      494.36 s (17396 steps)
+
+Switch Statistics:
+  Total switches: 0
+  Avg per sample: 0.00
+
+Avg Entropy: 0.0000
+============================================================
+
+============================================================
+EVALUATION RESULTS: gsm8k
+============================================================
+Accuracy: 54.66% (721/1319)
+
+Token Distribution:
+  Total tokens: 18923
+  Normal mode: 8716 (46.1%)
+  Latent mode:   10207 (53.9%)
+
+Time Statistics:
+  Normal mode avg: 27.638 ms/step
+  Latent mode avg:   27.601 ms/step
+  Normal total:    239.18 s (8654 steps)
+  Latent total:      247.03 s (8950 steps)
+
+Switch Statistics:
+  Total switches: 3750
+  Avg per sample: 2.84
+
+Avg Entropy: 0.4818
+============================================================
+
+============================================================
+EVALUATION RESULTS: gsm8k
+============================================================
+Accuracy: 37.38% (492/1319)
+
+Token Distribution:
+  Total tokens: 23308
+  Normal mode: 23308 (100.0%)
+  Latent mode:   0 (0.0%)
+
+Time Statistics:
+  Normal mode avg: 27.559 ms/step
+  Latent mode avg:   0.000 ms/step
+  Normal total:    606.00 s (21989 steps)
+  Latent total:      0.00 s (0 steps)
+
+Switch Statistics:
+  Total switches: 0
+  Avg per sample: 0.00
+
+Avg Entropy: 0.0000
+============================================================
+
+============================================================
+EVALUATION RESULTS: gsm8k (0.5 random)
+============================================================
+Accuracy: 42.76% (564/1319)
+
+Token Distribution:
+  Total tokens: 21769
+  Normal mode: 10773 (49.5%)
+  Latent mode:   10996 (50.5%)
+
+Time Statistics:
+  Normal mode avg: 28.354 ms/step
+  Latent mode avg:   28.589 ms/step
+  Normal total:    268.45 s (9468 steps)
+  Latent total:      313.97 s (10982 steps)
+
+Switch Statistics:
+  Total switches: 10289
+  Avg per sample: 7.80
+
+Avg Entropy: 0.0000
+============================================================
+
+============================================================                                                                                                                                                                                  
+EVALUATION RESULTS: gsm8k (1 random)                                                                                                                                                                                                                    
+============================================================                                                                                                                                                                                  
+Accuracy: 18.80% (248/1319)                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                              
+Token Distribution:                                                                                                                                                                                                                           
+  Total tokens: 148951                                                                                                                                                                                                                        
+  Normal mode: 148951 (100.0%)                                                                                                                                                                                                                
+  Latent mode:   0 (0.0%)
+
+Time Statistics:
+  Normal mode avg: 26.620 ms/step
+  Latent mode avg:   0.000 ms/step
+  Normal total:    3930.00 s (147632 steps)
+  Latent total:      0.00 s (0 steps)
+
+Switch Statistics:
+  Total switches: 0
+  Avg per sample: 0.00
+
+Avg Entropy: 0.0000
+============================================================
+
