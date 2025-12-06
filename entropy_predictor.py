@@ -97,11 +97,16 @@ class EntropyPredictor(nn.Module):
         
         return output
     
+    def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """预测 entropy，返回 (batch,)"""
+        return self.forward(hidden_states).squeeze(-1)
+    
     def save(self, path: str):
         """保存模型"""
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save({
             'model_state_dict': self.state_dict(),
+            'state_dict': self.state_dict(),  # 兼容 RawEntropyPredictor 格式
             'config': {
                 'hidden_dim': self.hidden_dim,
                 'num_layers': self.num_layers,
@@ -124,7 +129,15 @@ class EntropyPredictor(nn.Module):
             num_layers=config['num_layers'],
             intermediate_dim=config.get('intermediate_dim'),
         )
-        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 兼容两种保存格式: 'model_state_dict' (EntropyPredictor) 和 'state_dict' (RawEntropyPredictor)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
+        else:
+            raise KeyError(f"Checkpoint missing state dict. Available keys: {list(checkpoint.keys())}")
+        
         model = model.to(device)
         model.eval()
         
@@ -361,11 +374,11 @@ def compute_entropy_swir(logits: torch.Tensor) -> torch.Tensor:
     return entropy
 
 
-def compute_normalized_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """
-    归一化熵计算 (0-1 范围)
-    """
-    vocab_size = logits.size(-1)
-    max_entropy = torch.log(torch.tensor(vocab_size, dtype=logits.dtype, device=logits.device))
-    entropy = compute_entropy_swir(logits)
-    return entropy / max_entropy
+# def compute_normalized_entropy(logits: torch.Tensor) -> torch.Tensor:
+#     """
+#     归一化熵计算 (0-1 范围)
+#     """
+#     vocab_size = logits.size(-1)
+#     max_entropy = torch.log(torch.tensor(vocab_size, dtype=logits.dtype, device=logits.device))
+#     entropy = compute_entropy_swir(logits)
+#     return entropy / max_entropy

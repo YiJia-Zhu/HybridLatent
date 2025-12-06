@@ -1,15 +1,10 @@
 """
-阶段1: 数据收集脚本 (SwiReasoning风格熵计算)
+阶段1: 数据收集脚本 (支持 Llama-3.2 Instruct 格式)
 
-用普通 CoT 模型推理，收集 (hidden_states, entropy) 数据对
-熵计算方式参考 SwiReasoning：使用原始熵值，并记录熵的相对变化
-
-使用方法:
-    python step1_collect_entropy_data.py \
-        --model_path <pretrained_model> \
-        --data_name icot \
-        --output_path data/entropy_data.pt \
-        --max_samples 10000
+修改说明:
+1. 添加 Llama-3.2 Instruct 的 prompt 格式
+2. 添加调试打印功能
+3. 修复归一化熵计算
 """
 
 import torch
@@ -25,63 +20,60 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 
-# 导入本地模块
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from entropy_predictor import EntropyPredictor, EntropyDataset
-
 IGNORE_INDEX = -100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ============================================================================
+# Llama-3.2 Instruct 格式模板
+# ============================================================================
+
+LLAMA32_INSTRUCT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+{response}"""
+
+LLAMA32_QUESTION_ONLY = """<|begin_of_text|><|start_header_id|>user<|end_header_id|}
+
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+
+def format_llama32_instruct(question: str, cot: str, answer: str) -> Tuple[str, str, str]:
+    """格式化为 Llama-3.2 Instruct 格式"""
+    formatted_question = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+    # CoT 和 answer 保持原样，它们是 assistant 的回复部分
+    return formatted_question, cot, answer
+
 
 # ============================================================================
-# SwiReasoning 风格的熵计算
+# 熵计算函数
 # ============================================================================
 
 def compute_entropy_swir(logits: torch.Tensor) -> torch.Tensor:
-    """
-    SwiReasoning 风格的熵计算 (非归一化)
-    """
-    # 转换为 float32 计算，避免 float16 精度问题
+    """SwiReasoning 风格的熵计算 (非归一化)"""
     logits_f32 = logits.float()
     probs = F.softmax(logits_f32, dim=-1)
     entropy = -(probs * probs.clamp(min=1e-12).log()).sum(dim=-1)
-    # 转回原始 dtype
     return entropy.to(logits.dtype)
-
-def compute_normalized_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """
-    归一化熵计算 (0-1 范围)
-    用于 EntropyPredictor 的训练目标，方便设置阈值
-    """
-    vocab_size = logits.size(-1)
-    max_entropy = torch.log(torch.tensor(vocab_size, dtype=logits.dtype, device=logits.device))
-    entropy = compute_entropy_swir(logits)
-    return entropy / max_entropy
 
 
 def compute_entropy_features(
     logits: torch.Tensor,
     return_both: bool = True
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    计算熵相关特征，同时返回原始熵和归一化熵
-    
-    Args:
-        logits: (batch, seq_len, vocab_size)
-        return_both: 是否同时返回原始和归一化熵
-    
-    Returns:
-        raw_entropy: 原始熵值 (SwiReasoning风格)
-        normalized_entropy: 归一化熵 (0-1范围，用于训练)
-    """
+    """计算熵特征"""
     raw_entropy = compute_entropy_swir(logits)
     
     if return_both:
         vocab_size = logits.size(-1)
-        max_entropy = torch.log(torch.tensor(vocab_size, dtype=logits.dtype, device=logits.device))
-        normalized_entropy = raw_entropy / max_entropy
-        return raw_entropy, normalized_entropy
+        max_entropy = torch.log(torch.tensor(vocab_size, dtype=torch.float32, device=logits.device))
+        normalized_entropy = raw_entropy.float() / max_entropy
+        return raw_entropy, normalized_entropy.to(logits.dtype)
     
     return raw_entropy, None
 
@@ -90,54 +82,23 @@ def compute_entropy_dynamics(
     logits_sequence: torch.Tensor,
     window_size: int = 5
 ) -> Dict[str, torch.Tensor]:
-    """
-    计算熵的动态特征，参考 SwiReasoning 的模式切换逻辑
-    
-    SwiReasoning 的切换逻辑:
-    - to_normal: (mode == 0) & (cur_entropy < cur_ref_entropy) 
-    - to_soft: (mode == 1) & (cur_entropy > cur_ref_entropy) & allow_switch
-    
-    Args:
-        logits_sequence: (batch, seq_len, vocab_size)
-        window_size: 计算移动平均的窗口大小
-    
-    Returns:
-        dict containing:
-        - raw_entropy: 原始熵
-        - normalized_entropy: 归一化熵
-        - entropy_delta: 熵变化量 (current - previous)
-        - entropy_trend: 熵趋势 (1=上升/应使用soft, -1=下降/应使用normal, 0=稳定)
-        - moving_avg: 移动平均熵
-    """
+    """计算熵的动态特征"""
     batch_size, seq_len, vocab_size = logits_sequence.shape
     
-    # 计算每个位置的熵
     raw_entropy, normalized_entropy = compute_entropy_features(logits_sequence)
     
-    # 计算熵变化量 delta (SwiReasoning 用 cur_entropy vs ref_entropy)
     entropy_delta = torch.zeros_like(raw_entropy)
     entropy_delta[:, 1:] = raw_entropy[:, 1:] - raw_entropy[:, :-1]
     
-    # 熵趋势标记
-    # 熵下降 -> -1 (应该用 normal/显式)
-    # 熵上升 -> +1 (应该用 soft/隐式)  
     entropy_trend = torch.zeros_like(raw_entropy)
-    entropy_trend[entropy_delta > 0] = 1   # 熵上升
-    entropy_trend[entropy_delta < 0] = -1  # 熵下降
+    entropy_trend[entropy_delta > 0] = 1
+    entropy_trend[entropy_delta < 0] = -1
     
-    # 移动平均（参考 SwiReasoning 的 window_size 概念）
-    # 注意：SwiReasoning 的 window_size 实际上是指模式保持步数，不是平滑窗口
-    # 这里的移动平均只是辅助特征，不影响核心功能
     if seq_len >= window_size and window_size > 1:
-        # 在 float32 下计算避免精度问题
         raw_float = raw_entropy.float()
-        
-        # 用 avg_pool1d 计算移动平均
-        # 维度变换：(batch, seq) -> (batch, 1, seq) -> avg_pool -> (batch, seq)
-        raw_3d = raw_float.unsqueeze(1)  # (batch, 1, seq)
+        raw_3d = raw_float.unsqueeze(1)
         padded_3d = F.pad(raw_3d, (window_size - 1, 0), mode='replicate')
         moving_avg = F.avg_pool1d(padded_3d, kernel_size=window_size, stride=1).squeeze(1)
-        
         moving_avg = moving_avg.to(raw_entropy.dtype)
     else:
         moving_avg = raw_entropy.clone()
@@ -152,10 +113,10 @@ def compute_entropy_dynamics(
 
 
 # ============================================================================
-# 数据集和数据处理（与原版相同）
+# 数据集类 (支持 Llama-3.2 格式)
 # ============================================================================
 
-def _tokenize_fn(strings: Sequence[str], tokenizer, max_length: int = 512) -> Dict:
+def _tokenize_fn(strings: Sequence[str], tokenizer, max_length: int = 8192) -> Dict:
     """Tokenize a list of strings."""
     tokenized_list = [
         tokenizer(
@@ -178,19 +139,20 @@ def _tokenize_fn(strings: Sequence[str], tokenizer, max_length: int = 512) -> Di
     )
 
 
-class CoTDataset(Dataset):
-    """CoT数据集类"""
-    QUESTION_PROMPT = "\nAnswer the above question. First think step by step and then answer the final number.\n"
+class CoTDatasetLlama(Dataset):
+    """支持 Llama-3.2 Instruct 格式的 CoT 数据集"""
     
     def __init__(
         self, 
         data_name: str, 
         raw_data, 
         tokenizer, 
-        max_length: int = 512,
+        max_length: int = 8192,
         max_token_num: int = 1024,
         max_samples: int = None,
         include_last_cot: bool = True,
+        use_instruct_format: bool = True,  # 是否使用 Instruct 格式
+        debug_print: int = 3,  # 打印前 N 个样本用于调试
     ):
         super().__init__()
         logging.warning("Formatting inputs...")
@@ -198,11 +160,14 @@ class CoTDataset(Dataset):
         self.data_name = data_name
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.use_instruct_format = use_instruct_format
         
         self.questions = []
         self.cots = []
         self.answers = []
         self.full_texts = []
+        
+        debug_count = 0
         
         for num_iter, example in tqdm(enumerate(raw_data), desc="Processing data"):
             if max_samples and num_iter >= max_samples:
@@ -218,23 +183,43 @@ class CoTDataset(Dataset):
                 processed = self._process_example(example, data_name, tokenizer, max_token_num, include_last_cot)
                 if processed:
                     question, cot, answer = processed
+                    
+                    # 应用 Llama-3.2 Instruct 格式
+                    if use_instruct_format:
+                        question, cot, answer = format_llama32_instruct(question, cot, answer)
+                    
                     self.questions.append(question)
                     self.cots.append(cot)
                     self.answers.append(answer)
                     full_text = question + cot + answer
                     self.full_texts.append(full_text)
+                    
+                    # 调试打印
+                    if debug_count < debug_print:
+                        print(f"\n{'='*60}")
+                        print(f"Sample {debug_count + 1}:")
+                        print(f"{'='*60}")
+                        print(f"[Full Text]:\n{full_text}")
+                        print(f"\n[Tokenized length]: {len(tokenizer.encode(full_text))}")
+                        debug_count += 1
+                        
             except Exception as e:
                 logging.warning(f"Error processing example {num_iter}: {e}")
                 continue
         
-        print(f"{len(self.full_texts)} data in total...")
+        print(f"\n{len(self.full_texts)} data in total...")
         
         logging.warning("Tokenizing inputs...")
         self.tokenized = _tokenize_fn(self.full_texts, tokenizer, max_length)
         self.cot_positions = self._compute_cot_positions(tokenizer)
+        
+        # 打印 cot_positions 示例
+        if len(self.cot_positions) > 0:
+            print(f"\n[CoT Positions Example]:")
+            print(f"  First sample: {self.cot_positions[0]}")
     
     def _process_example(self, example, data_name, tokenizer, max_token_num, include_last_cot):
-        """处理单个样本"""
+        """处理单个样本 (返回原始格式，格式化在外部完成)"""
         if "icot" in data_name and "full" in data_name:
             if example.get("answer") is None or example.get("response") is None:
                 return None
@@ -298,10 +283,13 @@ class CoTDataset(Dataset):
         """计算每个样本中 CoT 部分的起始和结束位置"""
         positions = []
         for i, (question, cot, answer) in enumerate(zip(self.questions, self.cots, self.answers)):
-            q_tokens = tokenizer.encode(question, add_special_tokens=True)
+            # 对于 Llama-3.2 格式，question 已包含特殊标记
+            q_tokens = tokenizer.encode(question, add_special_tokens=False)
             cot_tokens = tokenizer.encode(cot, add_special_tokens=False)
+            
             cot_start = len(q_tokens)
             cot_end = cot_start + len(cot_tokens)
+            
             positions.append({
                 'cot_start': cot_start,
                 'cot_end': cot_end,
@@ -326,7 +314,7 @@ class CoTDataset(Dataset):
 
 @dataclass
 class DataCollatorForCollection:
-    """用于数据收集的Collator"""
+    """用于数据收集的 Collator"""
     tokenizer: object
     
     def __call__(self, instances: Sequence[Dict]) -> Dict:
@@ -341,6 +329,7 @@ class DataCollatorForCollection:
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'cot_positions': [inst['cot_positions'] for inst in instances],
+            'full_texts': [inst['full_text'] for inst in instances],
         }
 
 
@@ -373,29 +362,34 @@ def load_cot_dataset(data_name: str, data_path: str = None):
         else:
             raise ValueError(f"Unsupported file format: {data_path}")
     else:
-        raise ValueError(f"Dataset {data_name} is not supported and no data_path provided.")
+        raise ValueError(f"Dataset {data_name} not supported and no data_path provided.")
     
     return dataset
 
 
 # ============================================================================
-# 扩展的 EntropyDataset，支持额外特征
+# 扩展的 EntropyDataset
 # ============================================================================
 
-class EntropyDatasetExtended(EntropyDataset):
-    """
-    扩展的熵数据集，支持存储额外特征:
-    - raw_entropy: 原始熵值 (SwiReasoning风格)
-    - normalized_entropy: 归一化熵 (用于训练)
-    - entropy_delta: 熵变化量
-    - entropy_trend: 熵趋势 (-1, 0, 1)
-    """
+class EntropyDatasetExtended:
+    """扩展的熵数据集"""
     
     def __init__(self, data_path: str = None):
-        super().__init__(data_path)
+        self.hidden_states = []
+        self.entropies = []
         self.raw_entropies = []
         self.entropy_deltas = []
         self.entropy_trends = []
+        
+        if data_path and os.path.exists(data_path):
+            self.load(data_path)
+    
+    def __len__(self):
+        return len(self.hidden_states)
+    
+    def add_sample(self, hidden_state, normalized_entropy):
+        self.hidden_states.append(hidden_state)
+        self.entropies.append(normalized_entropy)
     
     def add_sample_extended(
         self,
@@ -405,9 +399,7 @@ class EntropyDatasetExtended(EntropyDataset):
         entropy_delta: torch.Tensor = None,
         entropy_trend: torch.Tensor = None,
     ):
-        """添加带有扩展特征的样本"""
         self.add_sample(hidden_state, normalized_entropy)
-        
         if raw_entropy is not None:
             self.raw_entropies.append(raw_entropy)
         if entropy_delta is not None:
@@ -416,74 +408,50 @@ class EntropyDatasetExtended(EntropyDataset):
             self.entropy_trends.append(entropy_trend)
     
     def save(self, path: str):
-        """保存数据（包括扩展特征）"""
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        
         data = {
             'hidden_states': torch.stack(self.hidden_states) if self.hidden_states else None,
             'entropies': torch.stack(self.entropies) if self.entropies else None,
         }
-        
         if self.raw_entropies:
             data['raw_entropies'] = torch.stack(self.raw_entropies)
         if self.entropy_deltas:
             data['entropy_deltas'] = torch.stack(self.entropy_deltas)
         if self.entropy_trends:
             data['entropy_trends'] = torch.stack(self.entropy_trends)
-        
         torch.save(data, path)
         print(f"Saved {len(self)} samples to {path}")
     
-    @classmethod
-    def load_extended(cls, path: str):
-        """加载扩展数据集"""
+    def load(self, path: str):
         data = torch.load(path)
-        dataset = cls()
-        
         if data.get('hidden_states') is not None:
-            dataset.hidden_states = list(data['hidden_states'])
+            self.hidden_states = list(data['hidden_states'])
         if data.get('entropies') is not None:
-            dataset.entropies = list(data['entropies'])
+            self.entropies = list(data['entropies'])
         if data.get('raw_entropies') is not None:
-            dataset.raw_entropies = list(data['raw_entropies'])
+            self.raw_entropies = list(data['raw_entropies'])
         if data.get('entropy_deltas') is not None:
-            dataset.entropy_deltas = list(data['entropy_deltas'])
+            self.entropy_deltas = list(data['entropy_deltas'])
         if data.get('entropy_trends') is not None:
-            dataset.entropy_trends = list(data['entropy_trends'])
-        
-        return dataset
+            self.entropy_trends = list(data['entropy_trends'])
 
 
 # ============================================================================
-# 数据收集
+# 数据收集 (带调试功能)
 # ============================================================================
 
 def collect_entropy_data(
     model,
     tokenizer,
-    dataset: CoTDataset,
+    dataset,
     device: torch.device,
     batch_size: int = 1,
     collect_positions: str = "all",
     compute_dynamics: bool = True,
     window_size: int = 5,
+    debug_batches: int = 2,  # 调试打印前 N 个 batch
 ) -> EntropyDatasetExtended:
-    """
-    收集 (hidden_states, entropy) 数据，使用 SwiReasoning 风格的熵计算
-    
-    Args:
-        model: 预训练的模型
-        tokenizer: tokenizer
-        dataset: CoTDataset 实例
-        device: 设备
-        batch_size: batch 大小
-        collect_positions: 收集哪些位置的数据 ("all", "cot", "answer")
-        compute_dynamics: 是否计算熵动态特征
-        window_size: 计算移动平均的窗口大小
-    
-    Returns:
-        EntropyDatasetExtended: 包含 (hidden_state, entropy) pairs 及扩展特征
-    """
+    """收集熵数据，带调试功能"""
     model.eval()
     entropy_dataset = EntropyDatasetExtended()
     
@@ -495,7 +463,9 @@ def collect_entropy_data(
         shuffle=False
     )
     
-    print(f"Collecting entropy data (positions={collect_positions}, dynamics={compute_dynamics})...")
+    print(f"\nCollecting entropy data (positions={collect_positions}, dynamics={compute_dynamics})...")
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Max entropy (log vocab): {torch.log(torch.tensor(float(tokenizer.vocab_size))).item():.4f}")
     
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting")):
         input_ids = batch['input_ids'].to(device)
@@ -512,10 +482,9 @@ def collect_entropy_data(
                 output_hidden_states=True,
             )
             
-            hidden_states = outputs.hidden_states[-1]  # (batch, seq_len, hidden_dim)
-            logits = outputs.logits  # (batch, seq_len, vocab_size)
+            hidden_states = outputs.hidden_states[-1]
+            logits = outputs.logits
             
-            # 使用 SwiReasoning 风格计算熵
             if compute_dynamics:
                 entropy_features = compute_entropy_dynamics(logits, window_size)
                 raw_entropy = entropy_features["raw_entropy"]
@@ -527,7 +496,33 @@ def collect_entropy_data(
                 entropy_delta = None
                 entropy_trend = None
         
-        # 根据收集策略添加数据
+        # 调试打印
+        if batch_idx < debug_batches:
+            print(f"\n{'='*60}")
+            print(f"Debug Batch {batch_idx + 1}:")
+            print(f"{'='*60}")
+            print(f"Input shape: {input_ids.shape}")
+            print(f"Logits shape: {logits.shape}")
+            
+            for i in range(min(2, input_ids.shape[0])):
+                seq_len = attention_mask[i].sum().item()
+                print(f"\n  Sample {i+1} (seq_len={seq_len}):")
+                print(f"    Raw entropy - mean: {raw_entropy[i, :seq_len].mean():.4f}, "
+                      f"std: {raw_entropy[i, :seq_len].std():.4f}, "
+                      f"min: {raw_entropy[i, :seq_len].min():.4f}, "
+                      f"max: {raw_entropy[i, :seq_len].max():.4f}")
+                print(f"    Normalized entropy - mean: {normalized_entropy[i, :seq_len].mean():.4f}, "
+                      f"std: {normalized_entropy[i, :seq_len].std():.4f}, "
+                      f"min: {normalized_entropy[i, :seq_len].min():.4f}, "
+                      f"max: {normalized_entropy[i, :seq_len].max():.4f}")
+                
+                # 打印几个 token 的详细信息
+                print(f"    First 10 tokens entropy:")
+                for j in range(min(10, seq_len)):
+                    token = tokenizer.decode([input_ids[i, j].item()])
+                    print(f"      pos {j}: '{token}' -> raw={raw_entropy[i,j]:.4f}, norm={normalized_entropy[i,j]:.4f}")
+        
+        # 收集数据
         for i in range(input_ids.shape[0]):
             seq_len = attention_mask[i].sum().item()
             cot_pos = cot_positions_batch[i]
@@ -562,61 +557,62 @@ def collect_entropy_data(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect entropy data (SwiReasoning style)")
+    parser = argparse.ArgumentParser(description="Collect entropy data (Llama-3.2 support)")
     
-    parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to pretrained CoT model")
+    parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_name", type=str, default="icot",
-                        choices=["icot", "icot-full", "strategy", "commonsense", "prontoqa", "custom"],
-                        help="Name of the dataset to use")
-    parser.add_argument("--data_path", type=str, default=None,
-                        help="Path to local data file")
-    parser.add_argument("--output_path", type=str, default="data/entropy_data_swir.pt",
-                        help="Output path for collected data")
-    parser.add_argument("--max_samples", type=int, default=None,
-                        help="Maximum number of samples to process")
-    parser.add_argument("--max_length", type=int, default=512,
-                        help="Maximum sequence length")
-    parser.add_argument("--max_token_num", type=int, default=1024,
-                        help="Maximum token number for filtering")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Batch size for data collection")
+                        choices=["icot", "icot-full", "strategy", "commonsense", "prontoqa", "custom"])
+    parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--output_path", type=str, default="data/entropy_data_llama.pt")
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--max_length", type=int, default=10240)
+    parser.add_argument("--max_token_num", type=int, default=8192)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--collect_positions", type=str, default="cot",
-                        choices=["all", "cot", "answer"],
-                        help="Which positions to collect data from")
-    parser.add_argument("--compute_dynamics", action="store_true",
-                        help="Compute entropy dynamics (delta, trend)")
-    parser.add_argument("--window_size", type=int, default=5,
-                        help="Window size for moving average")
-    parser.add_argument("--include_last_cot", action="store_true",
-                        help="Include the last CoT step")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to use")
+                        choices=["all", "cot", "answer"])
+    parser.add_argument("--compute_dynamics", action="store_true")
+    parser.add_argument("--window_size", type=int, default=5)
+    parser.add_argument("--include_last_cot", action="store_true")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--use_instruct_format", action="store_true", default=True,
+                        help="Use Llama-3.2 Instruct format")
+    parser.add_argument("--no_instruct_format", action="store_true",
+                        help="Disable Instruct format")
+    parser.add_argument("--debug_samples", type=int, default=3,
+                        help="Number of samples to print for debugging")
     
     args = parser.parse_args()
     
+    # 处理 instruct format 参数
+    use_instruct = args.use_instruct_format and not args.no_instruct_format
+    
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Use Instruct format: {use_instruct}")
     
     # 加载模型和 tokenizer
     print(f"Loading model from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
     ).to(device)
     
+    # 设置 pad token
     if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')
-        model.resize_token_embeddings(len(tokenizer))
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Pad token: '{tokenizer.pad_token}' (id={tokenizer.pad_token_id})")
+    print(f"EOS token: '{tokenizer.eos_token}' (id={tokenizer.eos_token_id})")
     
     # 加载数据
-    print(f"Loading dataset: {args.data_name}...")
+    print(f"\nLoading dataset: {args.data_name}...")
     raw_data = load_cot_dataset(args.data_name, args.data_path)
     
     # 创建数据集
-    dataset = CoTDataset(
+    dataset = CoTDatasetLlama(
         data_name=args.data_name,
         raw_data=raw_data,
         tokenizer=tokenizer,
@@ -624,6 +620,8 @@ def main():
         max_token_num=args.max_token_num,
         max_samples=args.max_samples,
         include_last_cot=args.include_last_cot,
+        use_instruct_format=use_instruct,
+        debug_print=args.debug_samples,
     )
     
     # 收集熵数据
@@ -636,6 +634,7 @@ def main():
         collect_positions=args.collect_positions,
         compute_dynamics=args.compute_dynamics,
         window_size=args.window_size,
+        debug_batches=2,
     )
     
     # 保存
@@ -644,70 +643,43 @@ def main():
     
     # 打印统计信息
     print("\n" + "=" * 60)
-    print("Data Collection Summary (SwiReasoning Style)")
+    print("Data Collection Summary")
     print("=" * 60)
     print(f"Dataset: {args.data_name}")
+    print(f"Use Instruct format: {use_instruct}")
     print(f"Total samples in dataset: {len(dataset)}")
     print(f"Collected data points: {len(entropy_dataset)}")
-    print(f"Collect positions: {args.collect_positions}")
-    print(f"Compute dynamics: {args.compute_dynamics}")
     
     if len(entropy_dataset) > 0:
-        # 归一化熵统计
         all_entropies = torch.stack(entropy_dataset.entropies)
-        print(f"\nNormalized Entropy (for training):")
+        print(f"\nNormalized Entropy:")
         print(f"  Mean: {all_entropies.mean().item():.4f}")
         print(f"  Std:  {all_entropies.std().item():.4f}")
         print(f"  Min:  {all_entropies.min().item():.4f}")
         print(f"  Max:  {all_entropies.max().item():.4f}")
         
-        # 原始熵统计 (SwiReasoning风格)
         if entropy_dataset.raw_entropies:
             raw_entropies = torch.stack(entropy_dataset.raw_entropies)
-            print(f"\nRaw Entropy (SwiReasoning style):")
+            print(f"\nRaw Entropy:")
             print(f"  Mean: {raw_entropies.mean().item():.4f}")
             print(f"  Std:  {raw_entropies.std().item():.4f}")
             print(f"  Min:  {raw_entropies.min().item():.4f}")
             print(f"  Max:  {raw_entropies.max().item():.4f}")
         
-        # 熵趋势统计
-        if entropy_dataset.entropy_trends:
-            trends = torch.stack(entropy_dataset.entropy_trends)
-            up_count = (trends > 0).sum().item()
-            down_count = (trends < 0).sum().item()
-            stable_count = (trends == 0).sum().item()
-            total = len(trends)
-            print(f"\nEntropy Trend Distribution:")
-            print(f"  Up (should use soft/latent): {up_count} ({up_count/total*100:.1f}%)")
-            print(f"  Down (should use normal): {down_count} ({down_count/total*100:.1f}%)")
-            print(f"  Stable: {stable_count} ({stable_count/total*100:.1f}%)")
-        
-        # 分布
         print(f"\nNormalized Entropy Distribution:")
-        bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         for i in range(len(bins) - 1):
             count = ((all_entropies >= bins[i]) & (all_entropies < bins[i+1])).sum().item()
             pct = count / len(all_entropies) * 100
-            print(f"  [{bins[i]:.1f}, {bins[i+1]:.1f}): {count} ({pct:.1f}%)")
+            bar = '█' * int(pct / 2)
+            print(f"  [{bins[i]:.1f}, {bins[i+1]:.1f}): {count:6d} ({pct:5.1f}%) {bar}")
+        
+        print(f"\nPercentiles:")
+        for p in [10, 25, 50, 75, 90]:
+            val = all_entropies.float().quantile(p / 100).item()
+            print(f"  {p:2d}th: {val:.4f}")
     
     print(f"\nData saved to: {args.output_path}")
-    
-    # 阈值建议（参考SwiReasoning的切换逻辑）
-    print("\n" + "=" * 60)
-    print("Threshold Recommendations (SwiReasoning Style)")
-    print("=" * 60)
-    print("SwiReasoning uses relative entropy comparison:")
-    print("  - cur_entropy < ref_entropy -> Switch to NORMAL (explicit)")
-    print("  - cur_entropy > ref_entropy -> Switch to SOFT (latent)")
-    print("\nFor absolute thresholds, consider percentiles:")
-    
-    if len(entropy_dataset) > 0:
-        percentiles = [25, 50, 75]
-        for p in percentiles:
-            # val = torch.tensor(all_entropies).quantile(p / 100).item()
-            val = all_entropies.float().quantile(p / 100).item()
-
-            print(f"  {p}th percentile: {val:.4f}")
 
 
 if __name__ == "__main__":

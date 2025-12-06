@@ -1,33 +1,35 @@
 """
 Normal Model Evaluation with vLLM
 
-使用 vLLM 进行标准模型的批量评估，支持多种数据集。
+使用 vLLM 进行标准模型的批量评估，支持多种数据集和模型类型。
 
 使用方法:
 
-# 基本用法
-python eval_normal_vllm.py \
+# Llama 模型
+python step0_baseline_eval.py \
     --model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
     --data_name gsm8k
 
-# 限制样本数（测试用）
-python eval_normal_vllm.py \
-    --model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+# GPT-2 模型
+python step0_baseline_eval.py \
+    --model_path gpt2 \
     --data_name gsm8k \
+    --model_type gpt2
+
+# 限制样本数（测试用）
+python step0_baseline_eval.py \
+    --model_path gpt2 \
+    --data_name gsm8k \
+    --model_type gpt2 \
     --max_samples 100 \
     --verbose
-
-# 评估其他数据集
-python eval_normal_vllm.py \
-    --model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-    --data_name multi-arith
 """
 
 import argparse
 import json
 import re
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from datasets import load_dataset, concatenate_datasets
 from vllm import LLM, SamplingParams
 
@@ -156,12 +158,49 @@ def format_prompt(question: str, model_type: str = "llama") -> str:
         # Llama-3 Instruct 格式
         return f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
 
-{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+{question} Let's think step by step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
+    elif model_type == "gpt2":
+        # GPT-2 格式 - 简单的 few-shot 或 completion 格式
+        # GPT-2 是基础语言模型，不是指令模型，需要用更简单的格式
+        return f"""Q: {question}
+A: Let me solve this step by step."""
+    elif model_type == "gpt2-simple":
+        # GPT-2 更简单的格式 - 直接续写
+        return f"Question: {question}\nAnswer:"
+    elif model_type == "gpt2-fewshot":
+        # GPT-2 few-shot 格式 - 提供示例帮助模型理解任务
+        return f"""Q: What is 2 + 3?
+A: 2 + 3 = 5. The answer is 5.
+
+Q: What is 10 - 4?
+A: 10 - 4 = 6. The answer is 6.
+
+Q: {question}
+A:"""
     else:
         # 通用格式
         return f"Question: {question}\nAnswer:"
+
+
+def detect_model_type(model_path: str, specified_type: Optional[str] = None) -> str:
+    """自动检测模型类型"""
+    if specified_type:
+        return specified_type
+    
+    model_path_lower = model_path.lower()
+    
+    if "gpt2" in model_path_lower or "gpt-2" in model_path_lower:
+        return "gpt2-fewshot"  # GPT-2 默认使用 few-shot 格式
+    elif "llama" in model_path_lower:
+        return "llama"
+    elif "qwen" in model_path_lower:
+        return "qwen"
+    elif "mistral" in model_path_lower:
+        return "mistral"
+    else:
+        return "default"
 
 
 # ============================================================================
@@ -174,30 +213,55 @@ def batch_generate(
     max_new_tokens: int = 256,
     temperature: float = 0.0,
     top_p: float = 1.0,
-) -> List[str]:
-    """批量生成"""
+    stop_tokens: Optional[List[str]] = None,
+) -> Tuple[List[str], Dict[str, float]]:
+    """
+    批量生成
+    返回: (outputs, token_stats)
+    token_stats 包含: total_tokens, avg_tokens, min_tokens, max_tokens
+    """
     sampling_params = SamplingParams(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        stop=stop_tokens,
     )
     
     outputs = model.generate(prompts, sampling_params)
     
     # 按照输入顺序排序输出
     results = [None] * len(prompts)
+    token_counts = [None] * len(prompts)
+    
     for output in outputs:
         idx = output.request_id
         # vLLM 返回的 request_id 可能是字符串形式的索引
         if isinstance(idx, str):
             idx = int(idx)
         results[idx] = output.outputs[0].text
+        # 统计生成的 token 数量
+        token_counts[idx] = len(output.outputs[0].token_ids)
     
     # 如果排序失败，按原始顺序返回
     if any(r is None for r in results):
         results = [output.outputs[0].text for output in outputs]
+        token_counts = [len(output.outputs[0].token_ids) for output in outputs]
     
-    return results
+    # 计算 token 统计信息
+    total_tokens = sum(token_counts)
+    avg_tokens = total_tokens / len(token_counts) if token_counts else 0
+    min_tokens = min(token_counts) if token_counts else 0
+    max_tokens = max(token_counts) if token_counts else 0
+    
+    token_stats = {
+        "total_tokens": total_tokens,
+        "avg_tokens": avg_tokens,
+        "min_tokens": min_tokens,
+        "max_tokens": max_tokens,
+        "token_counts": token_counts,  # 每个样本的 token 数
+    }
+    
+    return results, token_stats
 
 
 # ============================================================================
@@ -207,6 +271,7 @@ def batch_generate(
 def evaluate(
     model_path: str,
     data_name: str,
+    model_type: Optional[str] = None,
     max_samples: Optional[int] = None,
     max_new_tokens: int = 256,
     temperature: float = 0.0,
@@ -224,17 +289,29 @@ def evaluate(
         answers = answers[:max_samples]
     
     total_samples = len(questions)
+    
+    # 检测模型类型
+    detected_model_type = detect_model_type(model_path, model_type)
+    
     print(f"\n{'='*60}")
     print(f"Evaluating {data_name}: {total_samples} samples")
     print(f"Model: {model_path}")
+    print(f"Model type: {detected_model_type}")
     print(f"{'='*60}")
     
     # 加载 vLLM 模型
     print("\nLoading model with vLLM...")
     start_load = time.time()
+    
+    # GPT-2 使用 float32 或 float16，不支持 bfloat16
+    if "gpt2" in detected_model_type or "gpt2" in model_path.lower():
+        dtype = "float16"
+    else:
+        dtype = "bfloat16"
+    
     model = LLM(
         model=model_path,
-        dtype="bfloat16",
+        dtype=dtype,
         trust_remote_code=True,
         gpu_memory_utilization=gpu_memory_utilization,
     )
@@ -242,17 +319,22 @@ def evaluate(
     print(f"Model loaded in {load_time:.2f}s")
     
     # 格式化 prompts
-    model_type = "llama" if "llama" in model_path.lower() else "default"
-    prompts = [format_prompt(q, model_type) for q in questions]
+    prompts = [format_prompt(q, detected_model_type) for q in questions]
+    
+    # 设置停止 token
+    stop_tokens = None
+    if "gpt2" in detected_model_type:
+        stop_tokens = ["\n\n", "Q:", "Question:"]
     
     # 批量生成
     print(f"\nGenerating responses for {total_samples} samples...")
     start_gen = time.time()
-    outputs = batch_generate(
+    outputs, token_stats = batch_generate(
         model,
         prompts,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
+        stop_tokens=stop_tokens,
     )
     gen_time = time.time() - start_gen
     print(f"Generation completed in {gen_time:.2f}s")
@@ -277,14 +359,16 @@ def evaluate(
             "gold_answer": gold_answer,
             "pred_answer": pred_answer,
             "correct": is_correct,
+            "output_tokens": token_stats["token_counts"][i],
         }
         results.append(result)
         
         if verbose:
             print(f"\n[{i+1}/{total_samples}]")
             print(f"Q: {question[:80]}...")
-            print(f"A: {output[:100]}...")
+            print(f"A: {output[:200]}...")
             print(f"Pred: {pred_answer} | Gold: {gold_answer} | {'✓' if is_correct else '✗'}")
+            print(f"Output tokens: {token_stats['token_counts'][i]}")
     
     # 计算精度
     accuracy = compute_accuracy(answers, predictions)
@@ -294,27 +378,42 @@ def evaluate(
     print(f"EVALUATION RESULTS: {data_name}")
     print(f"{'='*60}")
     print(f"Model: {model_path}")
+    print(f"Model type: {detected_model_type}")
     print(f"Total samples: {total_samples}")
     print(f"Correct: {correct_count}")
     print(f"Accuracy: {accuracy*100:.2f}%")
+    print(f"\nToken Statistics:")
+    print(f"  Total output tokens: {token_stats['total_tokens']}")
+    print(f"  Average output tokens: {token_stats['avg_tokens']:.2f}")
+    print(f"  Min output tokens: {token_stats['min_tokens']}")
+    print(f"  Max output tokens: {token_stats['max_tokens']}")
     print(f"\nTiming:")
     print(f"  Model load time: {load_time:.2f}s")
     print(f"  Generation time: {gen_time:.2f}s")
     print(f"  Avg per sample: {gen_time/total_samples*1000:.2f}ms")
+    print(f"  Tokens per second: {token_stats['total_tokens']/gen_time:.2f}")
     print(f"{'='*60}\n")
     
     # 保存结果
     summary = {
         "model_path": model_path,
+        "model_type": detected_model_type,
         "dataset": data_name,
         "total_samples": total_samples,
         "correct": correct_count,
         "accuracy": accuracy,
         "accuracy_pct": accuracy * 100,
+        "token_stats": {
+            "total_output_tokens": token_stats["total_tokens"],
+            "avg_output_tokens": token_stats["avg_tokens"],
+            "min_output_tokens": token_stats["min_tokens"],
+            "max_output_tokens": token_stats["max_tokens"],
+        },
         "timing": {
             "model_load_time": load_time,
             "generation_time": gen_time,
             "avg_time_per_sample_ms": gen_time / total_samples * 1000,
+            "tokens_per_second": token_stats["total_tokens"] / gen_time,
         },
     }
     
@@ -341,10 +440,13 @@ def main():
     parser = argparse.ArgumentParser(description="Normal Model Evaluation with vLLM")
     
     parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to the model")
+                        help="Path to the model (e.g., gpt2, gpt2-medium, gpt2-large, gpt2-xl)")
     parser.add_argument("--data_name", type=str, default="gsm8k",
                         choices=["gsm8k", "gsm-hard", "multi-arith", "svamp", "commonsense"],
                         help="Dataset to evaluate")
+    parser.add_argument("--model_type", type=str, default=None,
+                        choices=["llama", "gpt2", "gpt2-simple", "gpt2-fewshot", "default"],
+                        help="Model type for prompt formatting (auto-detected if not specified)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Max samples to evaluate (None for all)")
     parser.add_argument("--max_new_tokens", type=int, default=256,
@@ -363,6 +465,7 @@ def main():
     evaluate(
         model_path=args.model_path,
         data_name=args.data_name,
+        model_type=args.model_type,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
