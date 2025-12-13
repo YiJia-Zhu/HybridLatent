@@ -1,7 +1,10 @@
 assets
 checkpoints
 Coconut
-CODI
+CODI/*
+!CODI/src/
+!CODI/*.py
+!CODI/*.sh
 data
 *.json
 
