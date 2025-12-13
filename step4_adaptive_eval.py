@@ -17,6 +17,18 @@
         --data_name gsm8k \
         --bf16 \
         --batch_size 8
+    
+    # Coconut 数据集评估
+    python step4_adaptive_eval.py \
+        --model_type coconut \
+        --base_model_path ./Coconut/pretrained/gpt2 \
+        --checkpoint_path ./Coconut/ckpts/gsm-coconut-gpt2/checkpoint_6 \
+        --predictor_path checkpoints/entropy_predictor.pt \
+        --data_name gsm8k \
+        --baseline_mode adaptive \
+        --max_switch_count 5 \
+        --window_e_to_l 5 \
+        --window_l_to_e 0
 """
 
 import torch
@@ -34,6 +46,8 @@ import logging
 from typing import Tuple, List, Optional, Dict
 from dataclasses import dataclass
 from datasets import load_dataset, concatenate_datasets
+from safetensors.torch import load_file
+import glob
 
 # 设置路径
 import sys
@@ -112,15 +126,21 @@ class SwiRModeState:
             ref_entropy=torch.zeros(batch_size, dtype=torch.float, device=device),
             locked_normal=torch.zeros(batch_size, dtype=torch.bool, device=device),
             switch_count=torch.zeros(batch_size, dtype=torch.long, device=device),
-            answer_locked=torch.zeros(batch_size, dtype=torch.bool, device=device),  # 新增
+            answer_locked=torch.zeros(batch_size, dtype=torch.bool, device=device),
         )
 
 
 class SwiRController:
     """SwiReasoning 风格的模式切换控制器"""
     
-    def __init__(self, window_size: int = 5, max_switch_count: Optional[int] = None):
-        self.window_size = window_size
+    def __init__(
+        self,         
+        window_e_to_l: int = 5,
+        window_l_to_e: int = 0,
+        max_switch_count: Optional[int] = None
+        ):
+        self.window_e_to_l = window_e_to_l
+        self.window_l_to_e = window_l_to_e
         self.max_switch_count = max_switch_count
     
     def update(
@@ -137,7 +157,6 @@ class SwiRController:
         if end_token_mask is not None:
             state.locked_normal = state.locked_normal | end_token_mask
         
-        # 如果已经锁定答案模式，强制保持 normal
         if state.answer_locked.any():
             state.mode = torch.where(state.answer_locked, torch.ones_like(state.mode), state.mode)
             to_normal = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -150,12 +169,12 @@ class SwiRController:
             to_soft = torch.zeros(batch_size, dtype=torch.bool, device=device)
         else:
             state.mode_stay_steps += 1
-            allow_switch = (state.mode_stay_steps >= self.window_size)
+            allow_l_to_e = (state.mode_stay_steps >= self.window_l_to_e)
+            allow_e_to_l = (state.mode_stay_steps >= self.window_e_to_l)
             
-            # TODO
-            to_normal = (state.mode == 0) & (cur_entropy < state.ref_entropy)
-            to_soft = (state.mode == 1) & (cur_entropy > state.ref_entropy) & allow_switch & (~state.locked_normal)
-            
+            to_normal = (state.mode == 0) & (cur_entropy < state.ref_entropy) & allow_l_to_e
+            to_soft = (state.mode == 1) & (cur_entropy > state.ref_entropy) & allow_e_to_l & (~state.locked_normal)
+
             state.mode = torch.where(to_normal, torch.ones_like(state.mode), state.mode)
             state.mode = torch.where(to_soft, torch.zeros_like(state.mode), state.mode)
             switched = to_normal | to_soft
@@ -163,11 +182,13 @@ class SwiRController:
             state.ref_entropy = torch.where(switched, cur_entropy, state.ref_entropy)
 
             if self.max_switch_count is not None:
-                state.switch_count = state.switch_count + to_normal.long()
+                state.switch_count = state.switch_count + switched.long()
+                limit_reached = (state.switch_count >= self.max_switch_count)
+                state.mode = torch.where(limit_reached, torch.ones_like(state.mode), state.mode)
+                state.locked_normal = state.locked_normal | limit_reached
         
         return state, to_normal, to_soft
-
-
+    
 
 class AdaptiveController:
     """结合 EntropyPredictor 和 SwiRController 的自适应控制器"""
@@ -175,22 +196,21 @@ class AdaptiveController:
     def __init__(
         self,
         entropy_predictor: Optional[EntropyPredictor],
-        window_size: int = 5,
+        window_e_to_l: int = 5,
+        window_l_to_e: int = 0,
         max_switch_count: Optional[int] = None,
         use_predicted_entropy: bool = True,
-        # Baseline 控制参数
-        baseline_mode: str = "adaptive", # "adaptive", "random"
-        random_prob: float = 0.5, # 仅用于 random 模式: 1.0=全Normal, 0.0=全Latent
+        baseline_mode: str = "adaptive",
+        random_prob: float = 0.5,
     ):
         self.predictor = entropy_predictor
-        self.controller = SwiRController(window_size=window_size, max_switch_count=max_switch_count)
+        self.controller = SwiRController(window_e_to_l=window_e_to_l, window_l_to_e=window_l_to_e, max_switch_count=max_switch_count)
         self.use_predicted_entropy = use_predicted_entropy
         self.state = None
         
-        # 模式属性
         self.baseline_mode = baseline_mode
         self.random_prob = random_prob
-        self.is_initialized = False # 用于标记状态是否已初始化，以控制随机模式的初始状态设置
+        self.is_initialized = False
         
     def init_state(self, batch_size: int, device: torch.device):
         """初始化模式状态"""
@@ -222,38 +242,28 @@ class AdaptiveController:
         device = hidden_states.device
         batch_size = hidden_states.shape[0]
         
-        # --- Baseline: Random/All Logic (包括 random_prob=1.0 和 0.0 的边界情况) ---
         if self.baseline_mode == "random":
-            
-            # 确保在整个生成过程的第 0 步初始化模式
             if step == 0 and self.is_initialized:
-                # 第一次随机初始化 mode: 1 (Normal) 概率为 random_prob
                 random_values = torch.rand(batch_size, device=device)
                 self.state.mode = (random_values < self.random_prob).long()
                 
-            # 每一步的随机切换逻辑
-            random_switch = torch.rand(batch_size, device=device) #[0,1)
+            random_switch = torch.rand(batch_size, device=device)
             
-            # 随机切换到 Normal (概率 random_prob)
             to_normal_new = (random_switch < self.random_prob) & (self.state.mode == 0)
-            # 随机切换到 Latent (概率 1 - random_prob)
             to_soft_new = (random_switch >= self.random_prob) & (self.state.mode == 1) & (~self.state.locked_normal)
             
-            # 更新模式
             mode = self.state.mode.clone()
             mode = torch.where(to_normal_new, torch.ones_like(mode), mode)
             mode = torch.where(to_soft_new, torch.zeros_like(mode), mode)
             
             self.state.mode = mode
             
-            # 返回结果：熵和 SwiRController 状态无关，设置为 0
             to_normal = to_normal_new
             to_soft = to_soft_new
             cur_entropy = torch.zeros(batch_size, dtype=torch.float, device=device) 
             
             return mode, to_normal, to_soft, cur_entropy
         
-        # --- Adaptive Logic (保持不变) ---
         elif self.baseline_mode == "adaptive":
             cur_entropy = self.get_entropy(hidden_states, logits)
             self.state, to_normal, to_soft = self.controller.update(self.state, cur_entropy, step, end_token_mask)
@@ -303,10 +313,8 @@ def load_eval_dataset(data_name: str) -> Tuple[List[str], List, str, str]:
     else:
         raise ValueError(f"Unknown dataset: {data_name}")
     
-    # 提取问题
     questions = [f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set]
     
-    # 提取答案
     answers = []
     for example in test_set:
         ans_raw = example[answer_name]
@@ -321,7 +329,6 @@ def load_eval_dataset(data_name: str) -> Tuple[List[str], List, str, str]:
             answers.append(ans_raw)
             continue
         
-        # 数值答案
         if "####" in str(ans_raw):
             ans = str(ans_raw).split('####')[-1]
         else:
@@ -382,7 +389,7 @@ def load_codi_model(
     use_bf16: bool = True,
     lora_r: int = 128,
     lora_alpha: int = 32,
-    prj_dim: int = 768,  # Add this parameter
+    prj_dim: int = 768,
 ):
     """加载 CODI 模型"""
     print(f"Loading CODI model...")
@@ -423,16 +430,24 @@ def load_codi_model(
         use_lora=True,
         bf16=use_bf16,
         use_prj=True,
-        prj_dim=prj_dim,  # Add this line
+        prj_dim=prj_dim,
     )
     
     model = CODI(model_args, training_args, lora_config)
     
     if ckpt_dir and os.path.exists(ckpt_dir):
-        try:
+        shard_files = sorted(glob.glob(os.path.join(ckpt_dir, "model-*.safetensors")))
+        
+        if shard_files:
+            print(f"Loading {len(shard_files)} sharded safetensors files...")
+            state_dict = {}
+            for shard_file in shard_files:
+                state_dict.update(load_file(shard_file))
+        elif os.path.exists(os.path.join(ckpt_dir, "model.safetensors")):
             state_dict = load_file(os.path.join(ckpt_dir, "model.safetensors"))
-        except Exception:
+        else:
             state_dict = torch.load(os.path.join(ckpt_dir, "pytorch_model.bin"), map_location='cpu')
+        
         model.load_state_dict(state_dict, strict=False)
         model.codi.tie_weights()
     
@@ -456,9 +471,8 @@ def load_codi_model(
     return model, tokenizer
 
 
-
 # ============================================================================
-# Coconut 模型加载
+# Coconut 模型加载 (修复版)
 # ============================================================================
 
 def load_coconut_model(
@@ -467,12 +481,25 @@ def load_coconut_model(
     device: torch.device,
     use_bf16: bool = False,
 ):
-    """加载 Coconut 模型"""
+    """
+    加载 Coconut 模型 (修复版)
+    
+    参考官方 Coconut 的 run.py 配置:
+    - mode: coconut_baseline
+    - 单文件 checkpoint 加载
+    
+    关键：需要根据 checkpoint 类型决定加载顺序
+    - 如果是基础模型权重（无 base_causallm 前缀）：先加载，再 resize
+    - 如果是 Coconut 完整权重（有 base_causallm 前缀）：先 resize，再加载
+    """
     print(f"Loading Coconut model...")
     print(f"  Base model: {base_model_path}")
     print(f"  Checkpoint: {checkpoint_path}")
     
+    # 1. 加载基础模型
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path)
+    
+    # 2. 加载 tokenizer 并添加特殊 token
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")
@@ -483,31 +510,99 @@ def load_coconut_model(
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
     
-    loaded = False
+    # 3. 预加载 checkpoint 以检查类型
     saved_weights = None
+    has_coconut_keys = False
+    
     if checkpoint_path and os.path.exists(checkpoint_path):
-        saved_weights = torch.load(checkpoint_path, map_location="cpu")
-        if not any([k.startswith("base_causallm") for k in saved_weights.keys()]):
-            loaded = True
-            base_model.load_state_dict(saved_weights, strict=False)
+        print(f"  Loading checkpoint from: {checkpoint_path}")
+        
+        # 判断是文件还是目录
+        if os.path.isfile(checkpoint_path):
+            saved_weights = torch.load(checkpoint_path, map_location="cpu")
+        else:
+            possible_files = [
+                os.path.join(checkpoint_path, "pytorch_model.bin"),
+                os.path.join(checkpoint_path, "model.safetensors"),
+            ]
+            for f in possible_files:
+                if os.path.exists(f):
+                    if f.endswith(".safetensors"):
+                        saved_weights = load_file(f)
+                    else:
+                        saved_weights = torch.load(f, map_location="cpu")
+                    break
+            
+            if saved_weights is None:
+                raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+        
+        # 检查是否是 Coconut 模型的 checkpoint
+        has_coconut_keys = any(k.startswith("base_causallm") for k in saved_weights.keys())
+        print(f"  Checkpoint has Coconut keys: {has_coconut_keys}")
+        
+        # 打印一些 keys 用于调试
+        sample_keys = list(saved_weights.keys())[:5]
+        print(f"  Sample keys: {sample_keys}")
     
-    base_model.resize_token_embeddings(len(tokenizer))
-    embeddings = base_model.get_input_embeddings()
-    target_id = tokenizer.convert_tokens_to_ids("<<")
-    for token_id in [latent_id, start_id, end_id]:
-        embeddings.weight.data[token_id] = embeddings.weight.data[target_id]
-        if hasattr(base_model, 'lm_head'):
-            base_model.lm_head.weight.data[token_id] = base_model.lm_head.weight.data[target_id]
+    # 4. 根据 checkpoint 类型决定加载顺序
+    if saved_weights is not None and not has_coconut_keys:
+        # 基础模型权重：先加载到基础模型，再 resize
+        print(f"  Loading base model weights first, then resize...")
+        missing, unexpected = base_model.load_state_dict(saved_weights, strict=False)
+        print(f"  Loaded base model checkpoint. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        
+        # 然后 resize token embeddings
+        base_model.resize_token_embeddings(len(tokenizer))
+        embeddings = base_model.get_input_embeddings()
+        target_id = tokenizer.convert_tokens_to_ids("<<")
+        
+        # 初始化新 token 的 embeddings
+        for token_id in [latent_id, start_id, end_id]:
+            embeddings.weight.data[token_id] = embeddings.weight.data[target_id].clone()
+            if hasattr(base_model, 'lm_head'):
+                base_model.lm_head.weight.data[token_id] = base_model.lm_head.weight.data[target_id].clone()
+        
+        # 创建 Coconut 模型
+        model = Coconut(base_model, latent_id, start_id, end_id, tokenizer.eos_token_id)
+        
+    else:
+        # Coconut 完整权重或无 checkpoint：先 resize，再加载
+        print(f"  Resize first, then load Coconut weights...")
+        
+        # 先 resize token embeddings
+        base_model.resize_token_embeddings(len(tokenizer))
+        embeddings = base_model.get_input_embeddings()
+        target_id = tokenizer.convert_tokens_to_ids("<<")
+        
+        # 初始化新 token 的 embeddings
+        for token_id in [latent_id, start_id, end_id]:
+            embeddings.weight.data[token_id] = embeddings.weight.data[target_id].clone()
+            if hasattr(base_model, 'lm_head'):
+                base_model.lm_head.weight.data[token_id] = base_model.lm_head.weight.data[target_id].clone()
+        
+        # 创建 Coconut 模型
+        model = Coconut(base_model, latent_id, start_id, end_id, tokenizer.eos_token_id)
+        
+        # 加载 Coconut 完整权重
+        if saved_weights is not None:
+            missing, unexpected = model.load_state_dict(saved_weights, strict=False)
+            print(f"  Loaded Coconut checkpoint. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            if missing:
+                print(f"  Missing keys sample: {missing[:5]}")
+            if unexpected:
+                print(f"  Unexpected keys sample: {unexpected[:5]}")
     
-    model = Coconut(base_model, latent_id, start_id, end_id, tokenizer.eos_token_id)
-    
-    if saved_weights is not None and not loaded:
-        model.load_state_dict(saved_weights, strict=False)
-    
+    # 5. 移动到设备并设置精度
     model = model.to(device)
     if use_bf16:
         model = model.to(torch.bfloat16)
     model.eval()
+    
+    print(f"  Model loaded successfully!")
+    print(f"  - latent_id: {latent_id}")
+    print(f"  - start_id: {start_id}")
+    print(f"  - end_id: {end_id}")
+    print(f"  - eos_token_id: {tokenizer.eos_token_id}")
     
     return model, tokenizer, latent_id, start_id, end_id
 
@@ -515,7 +610,7 @@ def load_coconut_model(
 # ============================================================================
 # CODI 自适应生成 (带时间统计)
 # ============================================================================
-# TODO
+
 def codi_adaptive_generate_with_timing(
     model: CODI,
     tokenizer,
@@ -527,13 +622,13 @@ def codi_adaptive_generate_with_timing(
     use_prj: bool = True,
     greedy: bool = True,
     answer_triggers: List[str] = None,
-    max_latent_steps: int = 6,  # 添加这个参数
+    max_latent_steps: int = 6,
     random_prob: float = 0.5,
 ) -> Tuple[Dict, TimeStats]:
     """修正版：思考阶段半显半隐，答案阶段锁定 normal，限制连续 latent 步数"""
     
     if answer_triggers is None:
-        answer_triggers = ["The answer is", "#### ", "the answer is", "Answer:", "= "]
+        answer_triggers = ["The answer is", "#### ", "the answer is", "Answer:",]
     
     if device is None:
         device = next(model.parameters()).device
@@ -555,16 +650,12 @@ def codi_adaptive_generate_with_timing(
     token_entropies = []
     switch_events = []
     
-    # 答案检测缓冲区
     generated_text_buffer = [""] * batch_size
-    
-    # 连续 latent 计数
     consecutive_latent_count = 0
     
     def get_embd(token_ids):
         return model.get_embd(model.codi, model.model_name)(token_ids)
     
-    # 初始编码
     past_key_values = None
     with torch.no_grad():
         outputs = model.codi(
@@ -587,14 +678,10 @@ def codi_adaptive_generate_with_timing(
     for step in range(max_new_tokens):
         start_time = time.perf_counter()
         
-        # ========== 检查连续 latent 上限 ==========
         if current_mode == "soft" and consecutive_latent_count >= max_latent_steps:
             current_mode = "normal"
             controller.state.mode[0] = 1
             consecutive_latent_count = 0
-            # 原CODI方案，纯latent
-            # if random_prob==0 and :
-            #     controller.state.locked_normal[0] = True
 
             if verbose:
                 print(f"[Step {step}] Max latent steps ({max_latent_steps}) reached, forcing normal mode")
@@ -636,16 +723,14 @@ def codi_adaptive_generate_with_timing(
             last_hidden, step + 1, logits, end_token_mask
         )
         
-        # ========== 处理当前模式 ==========
         if current_mode == "normal":
-            consecutive_latent_count = 0  # 重置计数
+            consecutive_latent_count = 0
             
             for b in range(batch_size):
                 if not finished[b]:
                     token_text = tokenizer.decode([next_token_ids[b].item()])
                     generated_text_buffer[b] += token_text
                     
-                    # 检测是否进入答案阶段
                     if not controller.state.answer_locked[b]:
                         for trigger in answer_triggers:
                             if trigger in generated_text_buffer[b]:
@@ -669,7 +754,7 @@ def codi_adaptive_generate_with_timing(
             })
             next_input_embd = get_embd(next_token_ids).unsqueeze(1)
         else:
-            consecutive_latent_count += 1  # 增加计数
+            consecutive_latent_count += 1
             
             generated_tokens.append({
                 "token_id": -1,
@@ -687,14 +772,10 @@ def codi_adaptive_generate_with_timing(
         token_modes.append(current_mode)
         token_entropies.append(cur_entropy[0].item())
         
-        # ========== 决定下一步模式 ==========
         if controller.state.answer_locked[0]:
             next_mode = "normal"
         elif consecutive_latent_count >= max_latent_steps:
             next_mode = "normal"
-            # 原CODI方案，纯latent
-            # if random_prob == 0 and:
-            #     controller.state.locked_normal[0] = True
         else:
             next_mode = "normal" if mode[0].item() == 1 else "soft"
         
@@ -719,8 +800,10 @@ def codi_adaptive_generate_with_timing(
         "total_steps": len(generated_tokens),
         "total_switches": len(switch_events),
     }, time_stats
+
+
 # ============================================================================
-# Coconut 自适应生成 (带时间统计)
+# Coconut 自适应生成 (修复版 - 带时间统计)
 # ============================================================================
 
 def coconut_adaptive_generate_with_timing(
@@ -728,74 +811,120 @@ def coconut_adaptive_generate_with_timing(
     tokenizer,
     controller: AdaptiveController,
     input_text: str,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 256,
     max_latent_steps: int = 6,
     device: torch.device = None,
     verbose: bool = False,
+    answer_triggers: List[str] = None,
 ) -> Tuple[Dict, TimeStats]:
-    """Coconut 自适应生成 (带时间统计)"""
+    """
+    Coconut 自适应生成 (修复版)
+    
+    参考官方 Coconut 的 generate 方法实现
+    """
+    if answer_triggers is None:
+        answer_triggers = ["####", "The answer is", "the answer is"]
+    
     if device is None:
         device = next(model.parameters()).device
     
     time_stats = TimeStats()
     
+    # 1. Tokenize 输入
     inputs = tokenizer(input_text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(device)
     batch_size = input_ids.shape[0]
     
+    assert batch_size == 1, "Coconut currently only supports batch_size == 1"
+    
+    # 2. 初始化控制器状态
     controller.init_state(batch_size, device)
     
+    # 记录变量
     generated_tokens = []
     token_modes = []
     token_entropies = []
     switch_events = []
-    latent_count = 0
+    generated_text_buffer = ""
+    consecutive_latent_count = 0
     
+    # 3. 初始前向传播 (处理输入)
     labels = input_ids.clone()
     position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).reshape(1, -1)
     
-    outputs = model.forward(
-        input_ids,
-        torch.ones_like(input_ids, device=device),
-        labels,
-        position_ids,
-    )
+    with torch.no_grad():
+        outputs = model.forward(
+            input_ids,
+            torch.ones_like(input_ids, device=device),
+            labels,
+            position_ids,
+        )
+    
     inputs_embeds = outputs.inputs_embeds
     
-    base_outputs = model.base_causallm(inputs_embeds=inputs_embeds, output_hidden_states=True)
-    hidden_states = base_outputs.hidden_states[-1][:, -1, :]
-    logits = base_outputs.logits[:, -1, :]
+    # 4. 获取初始 hidden states 和 logits
+    with torch.no_grad():
+        base_outputs = model.base_causallm(inputs_embeds=inputs_embeds, output_hidden_states=True)
     
+    hidden_states = base_outputs.hidden_states[-1][:, -1, :]  # [batch_size, hidden_dim]
+    logits = base_outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+    
+    # 5. 获取第一个 token
     next_token = torch.argmax(logits, dim=-1)
+    next_token_id = next_token[0].item()
     
+    # 6. 初始模式判断
     mode, to_normal, to_soft, cur_entropy = controller.step(hidden_states, 0, logits)
     current_mode = "normal" if mode[0].item() == 1 else "soft"
-    token_modes.append(current_mode)
-    token_entropies.append(cur_entropy[0].item())
     
+    # 记录第一个 token
+    token_text = tokenizer.decode([next_token_id])
     generated_tokens.append({
-        "token_id": next_token[0].item(),
-        "token_text": tokenizer.decode([next_token[0].item()]),
+        "token_id": next_token_id,
+        "token_text": token_text,
         "mode": current_mode,
         "entropy": cur_entropy[0].item(),
     })
+    token_modes.append(current_mode)
+    token_entropies.append(cur_entropy[0].item())
+    generated_text_buffer += token_text
     
-    new_token_embed = model.embedding(next_token).unsqueeze(1)
+    # 7. 更新 inputs_embeds
+    new_token_embed = model.embedding(next_token).unsqueeze(1)  # [1, 1, hidden_dim]
     new_inputs_embeds = torch.cat([inputs_embeds, new_token_embed], dim=1)
     
+    # 8. 生成循环
     for step in range(1, max_new_tokens):
         start_time = time.perf_counter()
-        base_outputs = model.base_causallm(inputs_embeds=new_inputs_embeds, output_hidden_states=True)
+        
+        # 检查是否达到连续 latent 上限
+        if current_mode == "soft" and consecutive_latent_count >= max_latent_steps:
+            current_mode = "normal"
+            controller.state.mode[0] = 1
+            consecutive_latent_count = 0
+            if verbose:
+                print(f"[Step {step}] Max latent steps ({max_latent_steps}) reached, forcing normal mode")
+        
+        # 前向传播
+        with torch.no_grad():
+            base_outputs = model.base_causallm(inputs_embeds=new_inputs_embeds, output_hidden_states=True)
+        
         step_time = time.perf_counter() - start_time
         
         hidden_states = base_outputs.hidden_states[-1][:, -1, :]
         logits = base_outputs.logits[:, -1, :]
         
+        # 获取下一个 token
         next_token = torch.argmax(logits, dim=-1)
+        next_token_id = next_token[0].item()
+        
+        # 检查是否结束
         end_token_mask = (next_token == tokenizer.eos_token_id)
         
-        mode, to_normal, to_soft, cur_entropy = controller.step(hidden_states, step, logits, end_token_mask)
-        current_mode = "normal" if mode[0].item() == 1 else "soft"
+        # 更新模式
+        mode, to_normal, to_soft, cur_entropy = controller.step(
+            hidden_states, step, logits, end_token_mask
+        )
         
         # 记录时间
         if current_mode == "normal":
@@ -803,6 +932,7 @@ def coconut_adaptive_generate_with_timing(
         else:
             time_stats.add_soft(step_time)
         
+        # 记录切换事件
         if to_normal[0].item():
             switch_events.append((step, "soft->normal", cur_entropy[0].item()))
         if to_soft[0].item():
@@ -811,11 +941,14 @@ def coconut_adaptive_generate_with_timing(
         token_modes.append(current_mode)
         token_entropies.append(cur_entropy[0].item())
         
-        is_soft = (mode == 0) & (~controller.state.locked_normal)
+        # 根据当前模式决定下一步操作
+        is_soft = (mode[0].item() == 0) and (not controller.state.locked_normal[0].item())
         
-        if is_soft[0].item() and latent_count < max_latent_steps:
-            latent_count += 1
-            new_token_embed = hidden_states.unsqueeze(1)
+        if current_mode == "soft" and is_soft and consecutive_latent_count < max_latent_steps:
+            # Latent 模式: 使用 hidden states 作为下一个输入
+            consecutive_latent_count += 1
+            new_token_embed = hidden_states.unsqueeze(1)  # [1, 1, hidden_dim]
+            
             generated_tokens.append({
                 "token_id": -1,
                 "token_text": "<latent>",
@@ -823,22 +956,52 @@ def coconut_adaptive_generate_with_timing(
                 "entropy": cur_entropy[0].item(),
             })
         else:
-            new_token_embed = model.embedding(next_token).unsqueeze(1)
+            # Normal 模式: 使用 token embedding
+            consecutive_latent_count = 0
+            
+            token_text = tokenizer.decode([next_token_id])
+            generated_text_buffer += token_text
+            
+            # 检查答案触发
+            if not controller.state.answer_locked[0]:
+                for trigger in answer_triggers:
+                    if trigger in generated_text_buffer:
+                        controller.state.answer_locked[0] = True
+                        controller.state.mode[0] = 1
+                        mode[0] = 1
+                        if verbose:
+                            print(f"[Step {step}] Answer trigger '{trigger}' detected, locking normal mode")
+                        break
+            
             generated_tokens.append({
-                "token_id": next_token[0].item(),
-                "token_text": tokenizer.decode([next_token[0].item()]),
+                "token_id": next_token_id,
+                "token_text": token_text,
                 "mode": current_mode,
                 "entropy": cur_entropy[0].item(),
             })
+            
+            new_token_embed = model.embedding(next_token).unsqueeze(1)
+            
+            # 检查是否结束
+            if next_token_id == tokenizer.eos_token_id:
+                break
         
+        # 更新 inputs_embeds
         new_inputs_embeds = torch.cat([new_inputs_embeds, new_token_embed], dim=1)
         
-        if next_token[0].item() == tokenizer.eos_token_id:
-            break
+        # 决定下一步模式
+        if controller.state.answer_locked[0]:
+            current_mode = "normal"
+        elif consecutive_latent_count >= max_latent_steps:
+            current_mode = "normal"
+        else:
+            current_mode = "normal" if mode[0].item() == 1 else "soft"
     
+    # 9. 提取输出文本 (只包含实际 token)
     output_tokens = [t["token_id"] for t in generated_tokens if t["token_id"] != -1]
     output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
     
+    # 10. 统计模式分布
     mode_counts = {"normal": 0, "soft": 0}
     for m in token_modes:
         mode_counts[m] += 1
@@ -852,7 +1015,7 @@ def coconut_adaptive_generate_with_timing(
         "avg_entropy": sum(token_entropies) / len(token_entropies) if token_entropies else 0,
         "total_steps": len(generated_tokens),
         "total_switches": len(switch_events),
-        "latent_count": latent_count,
+        "latent_count": sum(1 for t in generated_tokens if t["token_id"] == -1),
     }
     
     return result, time_stats
@@ -898,18 +1061,15 @@ def evaluate_dataset(
         
         result, time_stats = generate_fn(question)
         
-        # 提取预测答案
         pred_answer = extract_answer_number(result["output"], data_name)
         predictions.append(pred_answer)
         
-        # 累计统计
         global_time_stats.merge(time_stats)
         global_mode_counts["normal"] += result["mode_distribution"]["normal"]
         global_mode_counts["soft"] += result["mode_distribution"]["soft"]
         total_switches += result["total_switches"]
         total_entropy += result["avg_entropy"]
         
-        # 保存结果
         result["gold_answer"] = gold_answer
         result["pred_answer"] = pred_answer
         result["correct"] = (pred_answer == gold_answer)
@@ -920,10 +1080,8 @@ def evaluate_dataset(
             print(f"  Pred: {pred_answer} | Gold: {gold_answer} | {'✓' if pred_answer == gold_answer else '✗'}")
             print(f"  Modes: Normal={result['mode_distribution']['normal']}, Latent={result['mode_distribution']['soft']}")
     
-    # 计算精度
     accuracy = compute_accuracy(answers, predictions)
     
-    # 汇总统计
     total_tokens = global_mode_counts["normal"] + global_mode_counts["soft"]
     normal_pct = global_mode_counts["normal"] / total_tokens * 100 if total_tokens > 0 else 0
     soft_pct = global_mode_counts["soft"] / total_tokens * 100 if total_tokens > 0 else 0
@@ -955,7 +1113,6 @@ def evaluate_dataset(
         "avg_entropy": total_entropy / total_samples,
     }
     
-    # 打印结果
     print(f"\n{'='*60}")
     print(f"EVALUATION RESULTS: {data_name}")
     print(f"{'='*60}")
@@ -975,7 +1132,6 @@ def evaluate_dataset(
     print(f"\nAvg Entropy: {total_entropy/total_samples:.4f}")
     print(f"{'='*60}\n")
     
-    # 保存结果
     if output_file:
         output_data = {
             "summary": summary,
@@ -1000,13 +1156,14 @@ def main():
                         choices=["coconut", "codi"])
     parser.add_argument("--base_model_path", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, default=None,
-                        help="Coconut checkpoint path")
+                        help="Coconut checkpoint path (single file)")
     parser.add_argument("--ckpt_dir", type=str, default=None,
                         help="CODI checkpoint directory")
     parser.add_argument("--predictor_path", type=str, default=None,
                         help="EntropyPredictor path")
     parser.add_argument("--prj_dim", type=int, default=768,
                         help="Projection dimension for CODI")
+    
     # 数据集参数
     parser.add_argument("--data_name", type=str, default="gsm8k",
                         choices=["gsm8k", "gsm-hard", "multi-arith", "svamp", "commonsense"])
@@ -1015,7 +1172,10 @@ def main():
                         help="Max samples to evaluate (None for all)")
     
     # SwiReasoning 参数
-    parser.add_argument("--window_size", type=int, default=5)
+    parser.add_argument("--window_e_to_l", type=int, default=5,
+                        help="Explicit→Latent 切换需等待的步数")
+    parser.add_argument("--window_l_to_e", type=int, default=0,
+                        help="Latent→Explicit 切换需等待的步数（通常为0）")
     parser.add_argument("--max_switch_count", type=int, default=None)
     parser.add_argument("--use_predicted_entropy", action="store_true")
     
@@ -1027,17 +1187,15 @@ def main():
     
     # 其他参数
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output_file", type=str, default=None)
 
-
     # 消融实验
-    # 修改参数解析的 choices
-    parser.add_argument("--baseline_mode", type=str, default="random", 
+    parser.add_argument("--baseline_mode", type=str, default="adaptive", 
                         choices=["adaptive", "random"],
                         help="推理模式: adaptive(默认), random(随机/全显/全隐)")
-    parser.add_argument("--random_prob", type=float, default=0,
+    parser.add_argument("--random_prob", type=float, default=0.5,
                         help="随机模式下切换到 normal mode 的概率。设置 1.0 为全显, 0.0 为全隐。")
     
 
@@ -1055,7 +1213,8 @@ def main():
     # 创建控制器
     controller = AdaptiveController(
         entropy_predictor=predictor,
-        window_size=args.window_size,
+        window_e_to_l=args.window_e_to_l,
+        window_l_to_e=args.window_l_to_e,
         max_switch_count=args.max_switch_count,
         use_predicted_entropy=args.use_predicted_entropy and predictor is not None,
         baseline_mode=args.baseline_mode,
@@ -1064,12 +1223,15 @@ def main():
     
     # 加载模型
     if args.model_type == "coconut":
+        # Coconut 模型加载
         model, tokenizer, latent_id, start_id, end_id = load_coconut_model(
             args.base_model_path,
             args.checkpoint_path,
             device,
             use_bf16=args.bf16,
         )
+        
+        # Coconut 生成函数
         generate_fn = lambda text: coconut_adaptive_generate_with_timing(
             model, tokenizer, controller, text,
             max_new_tokens=args.max_new_tokens,
@@ -1084,7 +1246,7 @@ def main():
             device,
             num_latent=args.num_latent,
             use_bf16=args.bf16,
-            prj_dim=args.prj_dim,  # Add this line
+            prj_dim=args.prj_dim,
         )
         generate_fn = lambda text: codi_adaptive_generate_with_timing(
             model, tokenizer, controller, text,
@@ -1101,7 +1263,7 @@ def main():
     
     # 设置输出文件
     if args.output_file is None:
-        args.output_file = f"results_{args.model_type}_{args.data_name}_adaptive.json"
+        args.output_file = f"results_{args.model_type}_{args.data_name}_{args.baseline_mode}_{args.random_prob}.json"
     
     # 评估
     summary = evaluate_dataset(
