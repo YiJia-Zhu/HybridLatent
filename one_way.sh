@@ -102,14 +102,16 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --prj_dim 2048 \
     --prj_dropout 0.0 \
     --distill_loss_div_std True \
-    --distill_loss_factor 1 \
     --print_ref_model_stats True \
     --max_token_num 200 \
-    --ref_loss_factor 5 \
     --remove_eos True \
-    --use_adaptive_loss True \
-    --adaptive_loss_factor 5.0 \
-    --adaptive_window_e_to_l 5 \
+    --use_decoder \
+    --explain_loss_factor 1.0 \
+    --distill_loss_factor 20 \
+    --ref_loss_factor 1 \
+    --align_loss_factor 1.0\
+    --adaptive_training True\
+    --adaptive_window_e_to_l 0 \
     --adaptive_window_l_to_e 0 \
     --adaptive_loss_type smooth_l1 \
     2>&1 | tee "$TRAIN_LOG"
