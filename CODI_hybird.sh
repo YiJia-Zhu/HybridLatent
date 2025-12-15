@@ -36,7 +36,7 @@ python step4_adaptive_eval.py \
 python step4_adaptive_eval.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/sft_cot_full_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11 \
+    --ckpt_dir ./CODI/pretrained/Llama-3.2-1B-Instruct \
     --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
@@ -87,7 +87,10 @@ python step4_adaptive_eval.py \
     --bf16 \
     --batch_size 8 \
     --baseline_mode adaptive \
-    --prj_dim 4096
+    --prj_dim 4096 \
+    --max_switch_count 5 \
+    --window_e_to_l 5 \
+    --window_l_to_e 0 
 
 python step4_adaptive_eval.py \
     --model_type codi \
@@ -99,7 +102,10 @@ python step4_adaptive_eval.py \
     --batch_size 8 \
     --baseline_mode random \
     --random_prob 1 \
-    --prj_dim 4096
+    --prj_dim 4096 \
+    --max_switch_count 5 \
+    --window_e_to_l 5 \
+    --window_l_to_e 0 
 
 cd CODI
 bash ./src

@@ -8,19 +8,22 @@ SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
 # 训练参数（用于构建 CKPT_DIR 路径）
 MODEL_NAME="Llama-3.2-1B-Instruct"
 NUM_EPOCHS=1
-LEARNING_RATE=0.0008
+LEARNING_RATE=0.008
 SEED=11
 
 # 自动构建 CKPT_DIR
-CKPT_DIR="${SAVE_DIR}/${EXPT_NAME}/${MODEL_NAME}/ep_${NUM_EPOCHS}/lr_${LEARNING_RATE}/seed_${SEED}"
+# CKPT_DIR="${SAVE_DIR}/${EXPT_NAME}/${MODEL_NAME}/ep_${NUM_EPOCHS}/lr_${LEARNING_RATE}/seed_${SEED}"
+
+CKPT_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/pretrained/SIM_COT-LLaMA3-CODI-1B"
 
 # GPU 列表
-GPUS=(1 2 3)
+GPUS=(0 1 4)
 
 # ========== 日志配置 ==========
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_DIR="${SAVE_DIR}/logs_${TIMESTAMP}"
 mkdir -p "$LOG_DIR"
+cp "$0" "$LOG_DIR/run_script.sh"
 
 TRAIN_LOG="${LOG_DIR}/train_gpu${GPUS[0]}.log"
 TEST_LATENT_LOG="${LOG_DIR}/test_latent_gpu${GPUS[0]}.log"
@@ -77,14 +80,15 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --seed ${SEED} \
     --model_max_length 512 \
     --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 8 \
     --bf16 \
     --num_train_epochs ${NUM_EPOCHS} \
     --learning_rate ${LEARNING_RATE} \
     --max_grad_norm 2.0 \
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
-    --save_strategy "epoch" \
+    --save_strategy "steps" \
+    --save_steps 1000 \
     --save_total_limit 10 \
     --save_safetensors False \
     --weight_decay 0.1 \
@@ -101,18 +105,20 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --distill_loss_factor 1 \
     --print_ref_model_stats True \
     --max_token_num 200 \
-    --ref_loss_factor 1 \
+    --ref_loss_factor 5 \
     --remove_eos True \
     --use_adaptive_loss True \
     --adaptive_loss_factor 5.0 \
     --adaptive_window_e_to_l 5 \
     --adaptive_window_l_to_e 0 \
     --adaptive_loss_type smooth_l1 \
-    --exp_mode True \
-    --exp_data_num 10000 \
     2>&1 | tee "$TRAIN_LOG"
 
 
+
+    # --exp_mode True \
+    # --exp_data_num 10000 \
+    # --restore_from ./ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
     # --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
 
     # --hybrid_cot_only_ratio 1 \
@@ -130,31 +136,31 @@ echo "=========================================="
 echo "Starting parallel testing..."
 echo "=========================================="
 
-# Test Latent (GPU 0)
-echo "Test Latent on GPU ${GPUS[0]}... Log: $TEST_LATENT_LOG"
-CUDA_VISIBLE_DEVICES="${GPUS[0]}" python test.py \
-    --data_name "gsm8k" \
-    --output_dir "$SAVE_DIR" \
-    --model_name_or_path ./pretrained/${MODEL_NAME} \
-    --seed ${SEED} \
-    --model_max_length 512 \
-    --bf16 \
-    --lora_r 128 --lora_alpha 32 --lora_init \
-    --batch_size 128 \
-    --greedy True \
-    --num_latent 6 \
-    --use_prj True \
-    --prj_dim 2048 \
-    --prj_no_ln False \
-    --prj_dropout 0.0 \
-    --inf_latent_iterations 6 \
-    --inf_num_iterations 1 \
-    --remove_eos True \
-    --use_lora True \
-    --ckpt_dir "$CKPT_DIR" \
-    2>&1 | tee "$TEST_LATENT_LOG" &
-PID1=$!
-PIDS+=($PID1)
+# # Test Latent (GPU 0)
+# echo "Test Latent on GPU ${GPUS[0]}... Log: $TEST_LATENT_LOG"
+# CUDA_VISIBLE_DEVICES="${GPUS[0]}" python test.py \
+#     --data_name "gsm8k" \
+#     --output_dir "$SAVE_DIR" \
+#     --model_name_or_path ./pretrained/${MODEL_NAME} \
+#     --seed ${SEED} \
+#     --model_max_length 512 \
+#     --bf16 \
+#     --lora_r 128 --lora_alpha 32 --lora_init \
+#     --batch_size 128 \
+#     --greedy True \
+#     --num_latent 6 \
+#     --use_prj True \
+#     --prj_dim 2048 \
+#     --prj_no_ln False \
+#     --prj_dropout 0.0 \
+#     --inf_latent_iterations 6 \
+#     --inf_num_iterations 1 \
+#     --remove_eos True \
+#     --use_lora True \
+#     --ckpt_dir "$CKPT_DIR" \
+#     2>&1 | tee "$TEST_LATENT_LOG" &
+# PID1=$!
+# PIDS+=($PID1)
 
 # Test CoT (GPU 1)
 cd ${BASE_DIR}
@@ -201,9 +207,9 @@ echo ""
 echo "Waiting for all tests to complete..."
 echo "Running PIDs: ${PIDS[*]}"
 
-wait $PID1
-STATUS1=$?
-echo "Test Latent completed! (exit code: $STATUS1)"
+# wait $PID1
+# STATUS1=$?
+# echo "Test Latent completed! (exit code: $STATUS1)"
 
 wait $PID2
 STATUS2=$?

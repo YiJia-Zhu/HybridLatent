@@ -153,7 +153,7 @@ def get_steps(
     latent_num: int = 2,
     start_ids: Iterable[int] = (2501, 1134),
     end_id: int = 2511,
-    eot_id: int = 128009,
+    eos_id: int = 128009,
     pad_id: int = 128256,
     stop_ids: Iterable[int] = (128009, 128256),
     trim_at_first_stop: bool = True,
@@ -195,7 +195,7 @@ def get_steps(
                         break
                     j += 1
                 if end_pos is not None:
-                    steps_for_sample.append(seq[i:end_pos + 1] + [eot_id])
+                    steps_for_sample.append(seq[i:end_pos + 1] + [eos_id])
                     i = end_pos + 1
                     continue
             i += 1
@@ -205,11 +205,11 @@ def get_steps(
             kept = steps_for_sample[:max_steps - 1]
             merged: List[int] = []
             for s in steps_for_sample[max_steps - 1:]:
-                if len(s) > 0 and s[-1] == eot_id:
+                if len(s) > 0 and s[-1] == eos_id:
                     merged.extend(s[:-1])
                 else:
                     merged.extend(s)
-            merged.append(eot_id)
+            merged.append(eos_id)
             kept.append(merged)
             steps_for_sample = kept
         # <
@@ -476,7 +476,7 @@ class CODI(torch.nn.Module):
                 # steps_list = pad_steps(steps_list)
             elif 'gpt' in self.model_args.model_name_or_path.lower():
                 steps_list = get_steps(ref_input_ids, self.num_latent+1, start_ids=(16791, 9959), end_id=4211, 
-                                       eot_id=self.tokenizer.eos_token_id, pad_id=self.tokenizer.pad_token_id, 
+                                       eos_id=self.tokenizer.eos_token_id, pad_id=self.tokenizer.pad_token_id, 
                                        stop_ids=(self.tokenizer.eos_token_id, self.tokenizer.pad_token_id))
                 steps_pad_list = pad_steps(steps_list, pad_id=self.tokenizer.pad_token_id)
 

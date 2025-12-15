@@ -439,12 +439,12 @@ def evaluate(
 def main():
     parser = argparse.ArgumentParser(description="Normal Model Evaluation with vLLM")
     
-    parser.add_argument("--model_path", type=str, required=True,
+    parser.add_argument("--model_path", type=str, default="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11",
                         help="Path to the model (e.g., gpt2, gpt2-medium, gpt2-large, gpt2-xl)")
     parser.add_argument("--data_name", type=str, default="gsm8k",
                         choices=["gsm8k", "gsm-hard", "multi-arith", "svamp", "commonsense"],
                         help="Dataset to evaluate")
-    parser.add_argument("--model_type", type=str, default=None,
+    parser.add_argument("--model_type", type=str, default="llama",
                         choices=["llama", "gpt2", "gpt2-simple", "gpt2-fewshot", "default"],
                         help="Model type for prompt formatting (auto-detected if not specified)")
     parser.add_argument("--max_samples", type=int, default=None,
