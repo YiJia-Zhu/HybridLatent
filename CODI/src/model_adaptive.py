@@ -154,7 +154,10 @@ class TrainingArguments(transformers.TrainingArguments):
     window_l_to_e: int = field(default=0, metadata={"help": "Latent→Explicit需等待的步数"})
     max_switch_count: int = field(default=5, metadata={"help": "最大切换次数"})
     align_loss_factor: float = field(default=1.0, metadata={"help": "对齐loss权重"})
-
+    ce_loss_factor: float = field(default=1.0)
+    # 在 TrainingArguments dataclass 中添加:
+    baseline_mode: str = field(default="adaptive", metadata={"help": "训练模式: adaptive 或 random"})
+    random_prob: float = field(default=0.5, metadata={"help": "random模式下切换到normal的概率"})
 
 def print_trainable_parameters(model):
     trainable_parameters = 0
@@ -222,7 +225,8 @@ def get_steps(
                         break
                     j += 1
                 if end_pos is not None:
-                    steps_for_sample.append(seq[i:end_pos + 1] + [eos_id])
+                    # steps_for_sample.append(seq[i:end_pos + 1] + [eos_id])
+                    steps_for_sample.append(seq[i:end_pos + 1])
                     i = end_pos + 1
                     continue
             i += 1
@@ -440,6 +444,10 @@ class CODI(torch.nn.Module):
         # ===== 新增: 动态显隐训练 =====
         self.adaptive_training = getattr(training_args, 'adaptive_training', False)
         self.align_loss_factor = getattr(training_args, 'align_loss_factor', 1.0)
+        self.ce_loss_factor = getattr(training_args, 'ce_loss_factor', 1.0)
+
+        self.baseline_mode = getattr(training_args, 'baseline_mode', 'adaptive')
+        self.random_prob = getattr(training_args, 'random_prob', 0.5)
         
         # 初始化SwiR控制器 (与step4对齐)
         self.swir_controller = SwiRController(
@@ -520,6 +528,13 @@ class CODI(torch.nn.Module):
         
         return torch.tensor(padded, dtype=torch.long, device=device)
 
+    def _zero_loss(self):
+        """创建一个值为0但有grad_fn的标量"""
+        for p in self.codi.parameters():
+            if p.requires_grad:
+                return (p.flatten()[0] * 0.0)
+        return torch.tensor(0.0, device=self.codi.device, requires_grad=True)
+    
 
     def forward(
         self,
@@ -536,6 +551,28 @@ class CODI(torch.nn.Module):
         step_ratio: float = None,
         debug: bool = False,
     ):
+
+        # 在 forward 方法开头添加一个辅助函数:
+        def get_mode_decision(swir_state, cur_entropy, step_idx):
+            """根据 baseline_mode 决定模式"""
+            if self.baseline_mode == "random":
+                # random 模式：随机决定模式
+                random_val = torch.rand(batch_size, device=device)
+                if step_idx == 0:
+                    # 初始化时随机选择模式
+                    swir_state.mode = (random_val < self.random_prob).long()
+                else:
+                    # 随机切换
+                    to_normal = (random_val < self.random_prob) & (swir_state.mode == 0)
+                    to_soft = (random_val >= self.random_prob) & (swir_state.mode == 1)
+                    swir_state.mode = torch.where(to_normal, torch.ones_like(swir_state.mode), swir_state.mode)
+                    swir_state.mode = torch.where(to_soft, torch.zeros_like(swir_state.mode), swir_state.mode)
+                return swir_state, torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.bool, device=device)
+            else:
+                # adaptive 模式：使用原有的熵判断
+                return self.swir_controller.update(swir_state, cur_entropy, step=step_idx)
+
+
         if not self.fix_attn_mask:
             ref_attention_mask = None
         
@@ -720,11 +757,12 @@ class CODI(torch.nn.Module):
             print(f"  Initial latent_embd norm: {latent_embd.norm(dim=-1).mean().item():.4f}")
         
         # ========== 5. Loss累积 ==========
-        ce_loss_total = torch.tensor(0.0, device=device)
-        distill_loss_total = torch.tensor(0.0, device=device)
-        explain_loss_total = torch.tensor(0.0, device=device)
-        align_loss_total = torch.tensor(0.0, device=device)
-        
+        _zero = self._zero_loss()
+        ce_loss_total = _zero.clone()
+        distill_loss_total = _zero.clone()
+        explain_loss_total = _zero.clone()
+        align_loss_total = _zero.clone()
+
         mode_history = []
         entropy_history = []
         effective_ce_steps = 0
@@ -797,6 +835,26 @@ class CODI(torch.nn.Module):
                 
                 step_len = current_step_ids.size(1)
                 
+
+                # 处理当前句子和下一个步骤第一个token的loss，只有当上一步不是latent时才需要（latent→显式已在latent_exit_ce_loss处理）
+                if step_len >= 1 and not prev_was_latent:
+                    first_token = current_step_ids[:, 0].clone()
+                    # 过滤特殊token和pad
+                    first_token[first_token == model_pad_id] = -100
+                    if self.tokenizer.pad_token_id is not None:
+                        first_token[first_token == self.tokenizer.pad_token_id] = -100
+                    first_token[first_token == self.eot_id] = -100
+                    first_token[first_token == self.bot_id] = -100
+                    
+                    if (first_token != -100).any():
+                        explicit_entry_ce_loss = self.loss_fct(current_logits, first_token)
+                        ce_loss_total = ce_loss_total + explicit_entry_ce_loss
+                        
+                        if debug:
+                            target_decoded = self.tokenizer.decode([first_token[0].item()]) if first_token[0] != -100 else "[masked]"
+                            print(f"  ★ Explicit Entry CE Loss: {explicit_entry_ce_loss.item():.6f}, target='{target_decoded}'")
+
+
                 if step_len > 1:
                     step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
                     
@@ -907,7 +965,7 @@ class CODI(torch.nn.Module):
                 cur_entropy = compute_entropy_swir(current_logits)
                 entropy_history.append(cur_entropy.mean().item())
                 old_mode = swir_state.mode.clone()
-                swir_state, _, _ = self.swir_controller.update(swir_state, cur_entropy, step=step_i + 1)
+                swir_state, _, _ = get_mode_decision(swir_state, cur_entropy, step_i + 1)
                 
                 prev_was_latent = False
 
@@ -987,7 +1045,7 @@ class CODI(torch.nn.Module):
                 cur_entropy = compute_entropy_swir(current_logits)
                 entropy_history.append(cur_entropy.mean().item())
                 old_mode = swir_state.mode.clone()
-                swir_state, _, _ = self.swir_controller.update(swir_state, cur_entropy, step=step_i + 1)
+                swir_state, _, _ = get_mode_decision(swir_state, cur_entropy, step_i + 1)
                 new_mode = swir_state.mode[0].item()
                 
                 # 判断是否是Latent序列的最后一个
@@ -1020,13 +1078,41 @@ class CODI(torch.nn.Module):
                         )
                     past_key_values = eot_out.past_key_values
                     current_logits = eot_out.logits[:, -1, :]  # 更新logits
-                    
+
+
+
                     if debug:
                         top_probs, top_ids = torch.softmax(current_logits, dim=-1).topk(5, dim=-1)
                         for b in range(min(batch_size, 1)):
                             top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
                             print(f"  After EOT, Sample {b} top5: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
                     
+                    
+                    # ==== latent_exit_ce_loss补丁，eot后面需要学会预测"<<"
+                    eot_logits = eot_out.logits[:, -1, :]
+                    
+                    if next_step_ids is not None:
+                        # 有下一步：预测 
+                        target_token = next_step_ids[:, 0].clone()
+                    else:
+                        # 最后一步：预测 decoder_input_ids 的第一个 token（比如 "The"）
+                        target_token = decoder_input_ids[:, 0].clone()
+                    
+                    # 过滤 pad
+                    target_token[target_token == model_pad_id] = -100
+                    if self.tokenizer.pad_token_id is not None:
+                        target_token[target_token == self.tokenizer.pad_token_id] = -100
+                    
+                    if (target_token != -100).any():
+                        latent_exit_ce_loss = self.loss_fct(eot_logits, target_token)
+                        ce_loss_total = ce_loss_total + latent_exit_ce_loss
+
+                        if debug:
+                            target_decoded = self.tokenizer.decode([target_token[0].item()]) if target_token[0] != -100 else "[masked]"
+                            print(f"Latent_exit_ce_loss: {latent_exit_ce_loss.item():.6f}, target='{target_decoded}'")
+
+
+
                     # ===== Alignment Loss (只在最后一个Latent且有下一步时计算) =====
                     if debug:
                         print(f"\n[DEBUG] >>> ALIGNMENT LOSS CALCULATION <<<")
@@ -1159,6 +1245,24 @@ class CODI(torch.nn.Module):
                 dec_text = self.tokenizer.decode(decoder_input_ids[b], skip_special_tokens=False)
                 print(f"  Sample {b} decoder_input: {dec_text[:100]}...")
         
+
+        #  新增：答案入口loss 
+        # 如果最后一个step是latent，已在latent_exit_ce_loss中处理（next_step_ids为None时）
+        # 如果最后一个step是显式，需要额外计算
+        if not prev_was_latent:
+            ans_first_token = decoder_input_ids[:, 0].clone()
+            ans_first_token[ans_first_token == model_pad_id] = -100
+            if self.tokenizer.pad_token_id is not None:
+                ans_first_token[ans_first_token == self.tokenizer.pad_token_id] = -100
+            
+            if (ans_first_token != -100).any():
+                ans_entry_ce_loss = self.loss_fct(current_logits, ans_first_token)
+                ce_loss_total = ce_loss_total + ans_entry_ce_loss
+                
+                if debug:
+                    target_decoded = self.tokenizer.decode([ans_first_token[0].item()]) if ans_first_token[0] != -100 else "[masked]"
+                    print(f"  ★ Answer Entry CE Loss: {ans_entry_ce_loss.item():.6f}, target='{target_decoded}'")
+
         decoder_embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
         
         with autocast(dtype=torch.bfloat16):
@@ -1191,6 +1295,7 @@ class CODI(torch.nn.Module):
             ans_labels.reshape(-1)
         )
         ce_loss_total = ce_loss_total + ans_ce_loss
+        ce_loss_total = ce_loss_total * self.ce_loss_factor
         effective_ce_steps += 1
         
         if debug:
@@ -1200,8 +1305,9 @@ class CODI(torch.nn.Module):
             print(f"  Total effective explain steps: {effective_explain_steps}")
         
         # ========== 8. Distillation Loss ==========
+
         if debug:
-            print(f"\n[DEBUG] >>> DISTILLATION LOSS (Final Answer) <<<")
+            print(f"\\n[DEBUG] >>> DISTILLATION LOSS (Final Answer) <<<")
             
         if "llama" in self.model_name.lower() or "qwen" in self.model_name.lower():
             model_answer_position = model_answer_position + 1
@@ -1214,41 +1320,131 @@ class CODI(torch.nn.Module):
             print(f"  ref_answer_position: {ref_answer_position.tolist()}")
             print(f"  Target: Align model's final hidden state with teacher's hidden state at answer position")
             
-            print(f"\n  [DISTILL TARGET TOKENS]:")
+            # ===== 增强Debug: 打印教师对齐点及附近tokens =====
+            print(f"\\n  [TEACHER ALIGNMENT POINT TOKENS]:")
             for b in range(min(batch_size, 2)):
                 ref_pos = ref_answer_position[b].item()
                 if ref_pos >= 0 and ref_pos < ref_input_ids.size(1):
+                    # 对齐点token
                     target_token_id = ref_input_ids[b, ref_pos].item()
                     target_token_decoded = self.tokenizer.decode([target_token_id])
-                    ctx_start = max(0, ref_pos - 3)
-                    ctx_end = min(ref_input_ids.size(1), ref_pos + 5)
+                    
+                    # 扩大上下文窗口: 前10个token到后5个token
+                    ctx_start = max(0, ref_pos - 10)
+                    ctx_end = min(ref_input_ids.size(1), ref_pos + 6)
                     ctx_ids = ref_input_ids[b, ctx_start:ctx_end].tolist()
                     ctx_decoded = self.tokenizer.decode(ctx_ids, skip_special_tokens=False)
-                    print(f"    Sample {b}: ref_pos={ref_pos}, token_id={target_token_id}, token='{target_token_decoded}'")
-                    print(f"      Context[{ctx_start}:{ctx_end}]: {ctx_decoded}")
+                    
+                    # 逐token打印上下文
+                    print(f"    Sample {b}:")
+                    print(f"      ★ Alignment Point: pos={ref_pos}, token_id={target_token_id}, token='{target_token_decoded}'")
+                    print(f"      Context tokens [{ctx_start}:{ctx_end}]:")
+                    for i, tok_id in enumerate(ctx_ids):
+                        actual_pos = ctx_start + i
+                        tok_str = self.tokenizer.decode([tok_id])
+                        marker = ">>>>" if actual_pos == ref_pos else "    "
+                        print(f"        {marker} pos={actual_pos}: id={tok_id:6d}, token='{tok_str}'")
                 else:
                     print(f"    Sample {b}: ref_pos={ref_pos} (INVALID or out of range)")
+            
+            # ===== 增强Debug: 打印学生模型对齐点信息 =====
+            print(f"\\n  [STUDENT ALIGNMENT POINT INFO]:")
+            print(f"    Student uses final hidden state (position -1 in final_out)")
+            print(f"    final_out.logits shape: {final_out.logits.shape}")
+            print(f"    final_out.hidden_states[-1] shape: {final_out.hidden_states[-1].shape}")
+            
+            # 学生模型最后位置的预测
+            student_last_logits = final_out.logits[:, -1, :]
+            student_top_probs, student_top_ids = torch.softmax(student_last_logits, dim=-1).topk(5, dim=-1)
+            for b in range(min(batch_size, 2)):
+                top_tokens = [self.tokenizer.decode([tid]) for tid in student_top_ids[b].tolist()]
+                print(f"    Sample {b} student top5 predictions: {list(zip(top_tokens, [f'{p:.4f}' for p in student_top_probs[b].tolist()]))}")
         
+        # ===== 计算Distill Loss =====
         layer_distill_losses = []
+        layer_hidden_stats = []  # 记录每层的hidden state统计信息
+        
         for layer_idx, (out_h, ref_h) in enumerate(zip(final_out.hidden_states, ref_outputs.hidden_states)):
             ref_sel = ref_h.gather(1, ref_answer_position.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ref_h.size(-1)))
             out_sel = out_h[:, -1:, :]
             d_loss = self.distill_loss_fct(out_sel, ref_sel.detach())
+            
+            # 记录统计信息（用于debug）
+            if debug:
+                layer_hidden_stats.append({
+                    'layer': layer_idx,
+                    'student_norm': out_sel.norm(dim=-1).mean().item(),
+                    'teacher_norm': ref_sel.norm(dim=-1).mean().item(),
+                    'cosine_sim': F.cosine_similarity(out_sel.squeeze(1), ref_sel.squeeze(1), dim=-1).mean().item(),
+                    'l2_dist': (out_sel - ref_sel).pow(2).sum(dim=-1).sqrt().mean().item(),
+                    'loss_before_std': d_loss.item(),
+                })
+            
             if self.distill_loss_div_std:
-                d_loss = d_loss / ref_sel.std()
+                teacher_std = ref_sel.std()
+                d_loss = d_loss / teacher_std.clamp(min=1e-6)
+                if debug and layer_idx < 5:
+                    layer_hidden_stats[-1]['teacher_std'] = teacher_std.item()
+                    layer_hidden_stats[-1]['loss_after_std'] = d_loss.item()
+            
             distill_loss_total = distill_loss_total + d_loss
             layer_distill_losses.append(d_loss.item())
             
         distill_loss_total = distill_loss_total / len(final_out.hidden_states)
         
+        # ===== 增强Debug: 打印详细的层级Loss信息 =====
         if debug:
-            print(f"\n  *** Distillation Loss Calculation ***")
-            print(f"  out_sel shape: {out_sel.shape}")
-            print(f"  ref_sel shape: {ref_sel.shape}")
-            print(f"  Loss type: {self.distill_loss_type}")
-            print(f"  Layer losses (first 5): {layer_distill_losses[:5]}")
-            print(f"  Average across {len(final_out.hidden_states)} layers")
-            print(f"  *** Distillation Loss value (before factor): {distill_loss_total.item():.6f} ***")
+            print(f"\\n  [LAYER-WISE DISTILL LOSS DETAILS]:")
+            print(f"  Total layers: {len(final_out.hidden_states)}")
+            print(f"  distill_loss_div_std: {self.distill_loss_div_std}")
+            print(f"  distill_loss_type: {self.distill_loss_type}")
+            
+            print(f"\\n  === First 5 Layers (Embedding + Early Layers) ===")
+            for i in range(min(5, len(layer_hidden_stats))):
+                stats = layer_hidden_stats[i]
+                print(f"    Layer {i}:")
+                print(f"      Student norm: {stats['student_norm']:.4f}, Teacher norm: {stats['teacher_norm']:.4f}")
+                print(f"      Cosine similarity: {stats['cosine_sim']:.4f}")
+                print(f"      L2 distance: {stats['l2_dist']:.4f}")
+                print(f"      Loss (before std): {stats['loss_before_std']:.6f}")
+                if 'loss_after_std' in stats:
+                    print(f"      Teacher std: {stats['teacher_std']:.4f}, Loss (after std): {stats['loss_after_std']:.6f}")
+            
+            print(f"\\n  === Middle Layers Summary ===")
+            mid_start = 5
+            mid_end = len(layer_hidden_stats) - 5
+            if mid_end > mid_start:
+                mid_losses = [layer_hidden_stats[i]['loss_before_std'] for i in range(mid_start, mid_end)]
+                mid_cosines = [layer_hidden_stats[i]['cosine_sim'] for i in range(mid_start, mid_end)]
+                print(f"    Layers {mid_start} to {mid_end-1}:")
+                print(f"      Loss range: [{min(mid_losses):.6f}, {max(mid_losses):.6f}], mean: {sum(mid_losses)/len(mid_losses):.6f}")
+                print(f"      Cosine sim range: [{min(mid_cosines):.4f}, {max(mid_cosines):.4f}], mean: {sum(mid_cosines)/len(mid_cosines):.4f}")
+            
+            print(f"\\n  === Last 5 Layers ===")
+            for i in range(max(0, len(layer_hidden_stats) - 5), len(layer_hidden_stats)):
+                stats = layer_hidden_stats[i]
+                print(f"    Layer {i}:")
+                print(f"      Student norm: {stats['student_norm']:.4f}, Teacher norm: {stats['teacher_norm']:.4f}")
+                print(f"      Cosine similarity: {stats['cosine_sim']:.4f}")
+                print(f"      L2 distance: {stats['l2_dist']:.4f}")
+                print(f"      Loss (before std): {stats['loss_before_std']:.6f}")
+                if 'loss_after_std' in stats:
+                    print(f"      Teacher std: {stats['teacher_std']:.4f}, Loss (after std): {stats['loss_after_std']:.6f}")
+            
+            print(f"\\n  === Aggregate Statistics ===")
+            all_losses = layer_distill_losses
+            print(f"    Total distill loss (before factor): {distill_loss_total.item():.6f}")
+            print(f"    Layer losses - min: {min(all_losses):.6f}, max: {max(all_losses):.6f}, mean: {sum(all_losses)/len(all_losses):.6f}")
+            
+            # 检查是否有异常层
+            mean_loss = sum(all_losses) / len(all_losses)
+            std_loss = (sum((x - mean_loss)**2 for x in all_losses) / len(all_losses)) ** 0.5
+            anomaly_layers = [i for i, l in enumerate(all_losses) if abs(l - mean_loss) > 2 * std_loss]
+            if anomaly_layers:
+                print(f"    ⚠️ Anomaly layers (>2 std from mean): {anomaly_layers}")
+                for al in anomaly_layers[:3]:  # 只打印前3个异常层
+                    print(f"      Layer {al}: loss={all_losses[al]:.6f} (mean={mean_loss:.6f}, std={std_loss:.6f})")
+
         
         # ========== 9. Reference CE Loss ==========
         if debug:

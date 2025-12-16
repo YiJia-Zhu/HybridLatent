@@ -18,11 +18,12 @@ python step2_train_entropy_predictor.py \
 
 
 
+export CUDA_VISIBLE_DEVICES="4"
 
 python step4_adaptive_eval.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive/Llama-3.2-1B-Instruct/ep_1/lr_0.0008/seed_11 \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive_distill/Llama-3.2-1B-Instruct/ep_3/lr_0.008/seed_11/checkpoint-500 \
     --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
@@ -31,7 +32,8 @@ python step4_adaptive_eval.py \
     --prj_dim 2048 \
     --max_switch_count 5 \
     --window_e_to_l 5 \
-    --window_l_to_e 0 
+    --window_l_to_e 0 \
+    --max_samples 50
 
 python step4_adaptive_eval.py \
     --model_type codi \

@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ========== 配置变量 ==========
-EXPT_NAME="gsm8k_llama1b_adaptive"
+EXPT_NAME="gsm8k_llama1b_adaptive_distill"
 BASE_DIR="/storage/zyj_data/swilatent/SIM-CoT"
 SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
 
 # 训练参数（用于构建 CKPT_DIR 路径）
 MODEL_NAME="Llama-3.2-1B-Instruct"
-NUM_EPOCHS=1
+NUM_EPOCHS=3
 LEARNING_RATE=0.008
 SEED=11
 
@@ -17,7 +17,7 @@ SEED=11
 CKPT_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/pretrained/SIM_COT-LLaMA3-CODI-1B"
 
 # GPU 列表
-GPUS=(0 1 4)
+GPUS=(5 1 2)
 
 # ========== 日志配置 ==========
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -70,7 +70,8 @@ echo "Starting Training on GPU ${GPUS[0]}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
+# CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train_adaptive.py \
+CUDA_VISIBLE_DEVICES="1,2,4,5" torchrun --nproc_per_node=4 --master_port 29501 train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -88,7 +89,7 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --save_strategy "steps" \
-    --save_steps 1000 \
+    --save_steps 500 \
     --save_total_limit 10 \
     --save_safetensors False \
     --weight_decay 0.1 \
@@ -96,7 +97,7 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --lr_scheduler_type "cosine" \
     --do_train \
     --report_to tensorboard \
-    --num_latent 6 \
+    --num_latent 11 \
     --logging_strategy "steps" \
     --use_prj True \
     --prj_dim 2048 \
@@ -105,21 +106,19 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train.py \
     --print_ref_model_stats True \
     --max_token_num 200 \
     --remove_eos True \
-    --use_decoder \
-    --explain_loss_factor 1.0 \
-    --distill_loss_factor 20 \
-    --ref_loss_factor 1 \
-    --align_loss_factor 1.0\
     --adaptive_training True\
-    --adaptive_window_e_to_l 0 \
-    --adaptive_window_l_to_e 0 \
-    --adaptive_loss_type smooth_l1 \
+    --window_e_to_l 0 \
+    --window_l_to_e 0 \
+    --baseline_mode random --random_prob 0.5 \
+    --use_decoder \
+    --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 1 --align_loss_factor 20 --distill_loss_factor 20 \
+    --restore_from /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
     2>&1 | tee "$TRAIN_LOG"
 
+    
 
 
-    # --exp_mode True \
-    # --exp_data_num 10000 \
+
     # --restore_from ./ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
     # --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
 
