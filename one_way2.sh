@@ -7,8 +7,8 @@ SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
 
 # 训练参数（用于构建 CKPT_DIR 路径）
 MODEL_NAME="Llama-3.2-1B-Instruct"
-NUM_EPOCHS=10
-LEARNING_RATE=0.008
+NUM_EPOCHS=1
+LEARNING_RATE=0.0008
 SEED=11
 
 # 自动构建 CKPT_DIR
@@ -17,7 +17,7 @@ CKPT_DIR="${SAVE_DIR}/${EXPT_NAME}/${MODEL_NAME}/ep_${NUM_EPOCHS}/lr_${LEARNING_
 # CKPT_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/pretrained/SIM_COT-LLaMA3-CODI-1B"
 
 # GPU 列表（改为2张卡）
-GPUS=(7 4)
+GPUS=(6 7)
 
 # ========== 日志配置 ==========
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -70,7 +70,7 @@ echo "Starting Training on GPU ${GPUS[0]}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-CUDA_VISIBLE_DEVICES="4,7" torchrun --nproc_per_node=2 train.py \
+CUDA_VISIBLE_DEVICES="4,5,6,7" torchrun --nproc_per_node=4 --master_port 29505 train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -80,15 +80,16 @@ CUDA_VISIBLE_DEVICES="4,7" torchrun --nproc_per_node=2 train.py \
     --seed ${SEED} \
     --model_max_length 512 \
     --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 4 \
     --bf16 \
     --num_train_epochs ${NUM_EPOCHS} \
     --learning_rate ${LEARNING_RATE} \
     --max_grad_norm 2.0 \
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
-    --save_strategy "epoch" \
-    --save_total_limit 10 \
+    --save_strategy "steps" \
+    --save_steps 10 \
+    --save_total_limit 30 \
     --save_safetensors False \
     --weight_decay 0.1 \
     --warmup_ratio 0.03 \
@@ -101,23 +102,24 @@ CUDA_VISIBLE_DEVICES="4,7" torchrun --nproc_per_node=2 train.py \
     --prj_dim 2048 \
     --prj_dropout 0.0 \
     --distill_loss_div_std True \
-    --distill_loss_factor 1 \
     --print_ref_model_stats True \
     --max_token_num 200 \
-    --ref_loss_factor 1 \
     --remove_eos True \
-	--use_decoder True \
-    --explain_loss_factor 1.0 \
+    --adaptive_training True\
+    --window_e_to_l 5 \
+    --window_l_to_e 0 \
+    --exp_mode True \
+    --exp_data_num 10000 \
+    --baseline_mode random \
+    --random_prob 0.5 \
+    --use_decoder \
+    --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 0.1 --align_loss_factor 20 --distill_loss_factor 20 \
     2>&1 | tee "$TRAIN_LOG"
 
 
     # --exp_mode True \
     # --exp_data_num 10000 \
-    # --use_adaptive_loss True \
-    # --adaptive_loss_factor 5.0 \
-    # --adaptive_window_e_to_l 5 \
-    # --adaptive_window_l_to_e 0 \
-    # --adaptive_loss_type smooth_l1 \
+
     # --restore_from ./ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
     # --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
 
@@ -130,41 +132,41 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 echo "Training completed!"
 
-# ========== Test Latent (顺序执行) ==========
-echo ""
-echo "=========================================="
-echo "Starting Test Latent on GPU ${GPUS[0]}..."
-echo "=========================================="
-echo "Test Latent log: $TEST_LATENT_LOG"
+# # ========== Test Latent (顺序执行) ==========
+# echo ""
+# echo "=========================================="
+# echo "Starting Test Latent on GPU ${GPUS[0]}..."
+# echo "=========================================="
+# echo "Test Latent log: $TEST_LATENT_LOG"
 
-CUDA_VISIBLE_DEVICES="${GPUS[0]}" python test.py \
-    --data_name "gsm8k" \
-    --output_dir "$SAVE_DIR" \
-    --model_name_or_path ./pretrained/${MODEL_NAME} \
-    --seed ${SEED} \
-    --model_max_length 512 \
-    --bf16 \
-    --lora_r 128 --lora_alpha 32 --lora_init \
-    --batch_size 128 \
-    --greedy True \
-    --num_latent 6 \
-    --use_prj True \
-    --prj_dim 2048 \
-    --prj_no_ln False \
-    --prj_dropout 0.0 \
-    --inf_latent_iterations 6 \
-    --inf_num_iterations 1 \
-    --remove_eos True \
-    --use_lora True \
-    --ckpt_dir "$CKPT_DIR" \
-    2>&1 | tee "$TEST_LATENT_LOG"
+# CUDA_VISIBLE_DEVICES="${GPUS[0]}" python test.py \
+#     --data_name "gsm8k" \
+#     --output_dir "$SAVE_DIR" \
+#     --model_name_or_path ./pretrained/${MODEL_NAME} \
+#     --seed ${SEED} \
+#     --model_max_length 512 \
+#     --bf16 \
+#     --lora_r 128 --lora_alpha 32 --lora_init \
+#     --batch_size 128 \
+#     --greedy True \
+#     --num_latent 6 \
+#     --use_prj True \
+#     --prj_dim 2048 \
+#     --prj_no_ln False \
+#     --prj_dropout 0.0 \
+#     --inf_latent_iterations 6 \
+#     --inf_num_iterations 1 \
+#     --remove_eos True \
+#     --use_lora True \
+#     --ckpt_dir "$CKPT_DIR" \
+#     2>&1 | tee "$TEST_LATENT_LOG"
 
-# 检查 Test Latent 是否成功
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo "Test Latent failed! Check log: $TEST_LATENT_LOG"
-    exit 1
-fi
-echo "Test Latent completed!"
+# # 检查 Test Latent 是否成功
+# if [ ${PIPESTATUS[0]} -ne 0 ]; then
+#     echo "Test Latent failed! Check log: $TEST_LATENT_LOG"
+#     exit 1
+# fi
+# echo "Test Latent completed!"
 
 # ========== 并行测试 (2个GPU并行运行 step4_adaptive_eval) ==========
 echo ""
@@ -180,7 +182,6 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python step4_adaptive_eval.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/${MODEL_NAME} \
     --ckpt_dir "$CKPT_DIR" \
-    --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
     --batch_size 8 \
@@ -196,19 +197,19 @@ PIDS+=($PID1)
 
 # Test Adaptive (GPU 1)
 echo "Test Adaptive on GPU ${GPUS[1]}... Log: $TEST_ADAPTIVE_LOG"
-CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_eval.py \
+CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_step.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/${MODEL_NAME} \
     --ckpt_dir "$CKPT_DIR" \
-    --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
     --batch_size 8 \
     --baseline_mode adaptive \
     --prj_dim 2048 \
     --max_switch_count 5 \
-    --window_e_to_l 5 \
+    --window_e_to_l 0 \
     --window_l_to_e 0 \
+    --max_latent_steps 3 \
     2>&1 | tee "$TEST_ADAPTIVE_LOG" &
 PID2=$!
 PIDS+=($PID2)

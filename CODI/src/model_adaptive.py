@@ -25,7 +25,7 @@ import math
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import sys
 sys.path.append('..')  # 或使用绝对路径
-from step4_adaptive_eval import SwiRController, SwiRModeState
+from Swicontrol import SwiRController, SwiRModeState
 
 
 def compute_entropy_swir(logits: torch.Tensor) -> torch.Tensor:
@@ -413,14 +413,18 @@ class CODI(torch.nn.Module):
             )
             if not self.prj_no_ln:
                 self.prj.add_module("ln", nn.LayerNorm(self.dim))
-                
+
+            codi_dtype = next(self.codi.parameters()).dtype
+            self.prj = self.prj.to(codi_dtype)     
+
         # Losses
         self.print_loss = training_args.print_loss
         self.ref_loss_factor = training_args.ref_loss_factor
 
         # Cross Entropy Loss
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100) 
-        
+        self.loss_fct_sum = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+
         # Distillation Loss
         self.distill_loss_div_std = training_args.distill_loss_div_std
         self.distill_loss_type = training_args.distill_loss_type
@@ -609,18 +613,6 @@ class CODI(torch.nn.Module):
                 print(f"  Sample {b}: {ref_text[:500]}...")
                 print(f"  Last token: {ref_input_ids[b][-1].item()}, EOT={self.eot_id}, EOS={self.tokenizer.eos_token_id}")
                 
-        # ========== 1. 教师模型输出 ==========
-        if debug:
-            print(f"\n[DEBUG] >>> TEACHER MODEL FORWARD <<<")
-            
-        with torch.no_grad():
-            ref_outputs = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
-        ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
-        
-        if debug:
-            print(f"  ref_outputs.logits shape: {ref_outputs.logits.shape}")
-            print(f"  ref_outputs.hidden_states: {len(ref_outputs.hidden_states)} layers")
-            print(f"  Each hidden state shape: {ref_outputs.hidden_states[0].shape}")
         
         # ========== 2. 解析步骤 ==========
         if debug:
@@ -713,7 +705,7 @@ class CODI(torch.nn.Module):
         # ========== 3. Encode问题 ==========
         if debug:
             print(f"\n[DEBUG] >>> ENCODER FORWARD <<<")
-            
+        past_key_values = None
         outputs = self.codi(
             input_ids=encoder_input_ids,
             use_cache=True,
@@ -735,6 +727,19 @@ class CODI(torch.nn.Module):
                 top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
                 print(f"  Sample {b} top5 after encoder: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
         
+        # ========== 1. 教师模型输出 ==========
+        if debug:
+            print(f"\n[DEBUG] >>> TEACHER MODEL FORWARD <<<")
+            
+        with torch.no_grad():
+            ref_outputs = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
+        ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
+        
+        if debug:
+            print(f"  ref_outputs.logits shape: {ref_outputs.logits.shape}")
+            print(f"  ref_outputs.hidden_states: {len(ref_outputs.hidden_states)} layers")
+            print(f"  Each hidden state shape: {ref_outputs.hidden_states[0].shape}")
+
         # ========== 4. 初始化SwiR状态 ==========
         if debug:
             print(f"\n[DEBUG] >>> SWIR INIT <<<")
@@ -767,6 +772,7 @@ class CODI(torch.nn.Module):
         entropy_history = []
         effective_ce_steps = 0
         effective_explain_steps = 0
+        ce_token_count = 0  # 总token数
         
         # ========== 用于追踪alignment loss计算 ==========
         alignment_computed_at_steps = []  # 记录在哪些step计算了alignment loss
@@ -846,10 +852,15 @@ class CODI(torch.nn.Module):
                     first_token[first_token == self.eot_id] = -100
                     first_token[first_token == self.bot_id] = -100
                     
+                    # if (first_token != -100).any():
+                    #     explicit_entry_ce_loss = self.loss_fct(current_logits, first_token)
+                    #     ce_loss_total = ce_loss_total + explicit_entry_ce_loss
                     if (first_token != -100).any():
-                        explicit_entry_ce_loss = self.loss_fct(current_logits, first_token)
+                        valid_entry = (first_token != -100).sum().item()
+                        explicit_entry_ce_loss = self.loss_fct_sum(current_logits, first_token)
                         ce_loss_total = ce_loss_total + explicit_entry_ce_loss
-                        
+                        ce_token_count += valid_entry
+
                         if debug:
                             target_decoded = self.tokenizer.decode([first_token[0].item()]) if first_token[0] != -100 else "[masked]"
                             print(f"  ★ Explicit Entry CE Loss: {explicit_entry_ce_loss.item():.6f}, target='{target_decoded}'")
@@ -913,12 +924,22 @@ class CODI(torch.nn.Module):
                                     print(f"    Pred: {pred_decoded}")
                                     print(f"    True: {true_decoded}")
                     
+                    # if (step_labels != -100).sum() > 0:
+                    #     ce_loss = self.loss_fct(
+                    #         step_logits.reshape(-1, step_logits.size(-1)),
+                    #         step_labels.reshape(-1)
+                    #     )
+                    #     ce_loss_total = ce_loss_total + ce_loss
+                    #     effective_ce_steps += 1
+                                    
                     if (step_labels != -100).sum() > 0:
-                        ce_loss = self.loss_fct(
+                        valid_step_tokens = (step_labels != -100).sum().item()
+                        ce_loss = self.loss_fct_sum(
                             step_logits.reshape(-1, step_logits.size(-1)),
                             step_labels.reshape(-1)
                         )
                         ce_loss_total = ce_loss_total + ce_loss
+                        ce_token_count += valid_step_tokens
                         effective_ce_steps += 1
                         
                         if debug:
@@ -1036,6 +1057,73 @@ class CODI(torch.nn.Module):
                         top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
                         print(f"  After LATENT, Sample {b} top5: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
                     print(f"  Updated latent_embd shape: {latent_embd.shape}")
+
+
+                # ===== 5. Explain Loss (改为对齐当前step) =====
+                if debug:
+                    print(f"\n[DEBUG] >>> EXPLAIN LOSS CALCULATION <<<")
+                    
+                if self.model_args.use_decoder:
+                    # 改动1: 使用 current_step_ids 而不是 next_step_ids
+                    current_step_len = current_step_ids.size(1)
+                    if current_step_len > 0:
+                        if debug:
+                            print(f"\n  Input preparation:")
+                            print(f"    current_step_ids shape: {current_step_ids.shape}")
+                        
+                        # 改动2: 用当前step的embedding
+                        current_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
+                        
+                        # 改动3: decoder输入为 [latent, current_step]，不需要eot分隔符
+                        decoder_input = torch.cat([latent_embd, current_embds], dim=1)
+                        
+                        if debug:
+                            print(f"    decoder_input shape: {decoder_input.shape} = [LATENT(1) + current({current_step_len})]")
+                        
+                        # 改动4: prefix只有1个位置（latent），不是2个
+                        prefix_placeholder = torch.full((batch_size, 1), -570, dtype=current_step_ids.dtype, device=device)
+                        indices_with_prefix = torch.cat([prefix_placeholder, current_step_ids], dim=1)
+                        
+                        explain_labels = indices_with_prefix.clone()
+                        explain_labels = explain_labels.masked_fill(
+                            (explain_labels == -570) | (explain_labels == model_pad_id),
+                            -100
+                        )
+                        if self.tokenizer.pad_token_id is not None:
+                            explain_labels = explain_labels.masked_fill(explain_labels == self.tokenizer.pad_token_id, -100)
+                        
+                        explain_attention_mask = (indices_with_prefix != model_pad_id) & (indices_with_prefix != -570)
+                        if self.tokenizer.pad_token_id is not None:
+                            explain_attention_mask = explain_attention_mask & (indices_with_prefix != self.tokenizer.pad_token_id)
+                        
+                        if hasattr(self, 'pj_in'):
+                            decoder_input = self.pj_in(decoder_input)
+                        
+                        if (explain_labels != -100).sum() > 0:
+                            with autocast(dtype=torch.bfloat16):
+                                dec_out = self.decoder(
+                                    inputs_embeds=decoder_input,
+                                    attention_mask=explain_attention_mask,
+                                    output_hidden_states=True
+                                )
+                            
+                            dec_logits = dec_out.logits
+                            if hasattr(self, 'pj_out'):
+                                dec_logits = self.pj_out(dec_logits)
+                            
+                            shift_logits = dec_logits[:, :-1, :].contiguous()
+                            shift_labels = explain_labels[:, 1:].contiguous()
+                            
+                            if (shift_labels != -100).sum() > 0:
+                                explain_loss = self.loss_fct(
+                                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                                    shift_labels.reshape(-1)
+                                )
+                                explain_loss_total = explain_loss_total + explain_loss
+                                effective_explain_steps += 1
+                                
+                                if debug:
+                                    print(f"  *** Explain Loss value: {explain_loss.item():.6f} ***")
                 
                 # ===== 3. 基于latent输出计算熵，更新模式 =====
                 if debug:
@@ -1103,10 +1191,14 @@ class CODI(torch.nn.Module):
                     if self.tokenizer.pad_token_id is not None:
                         target_token[target_token == self.tokenizer.pad_token_id] = -100
                     
+                    # if (target_token != -100).any():
+                    #     latent_exit_ce_loss = self.loss_fct(eot_logits, target_token)
+                    #     ce_loss_total = ce_loss_total + latent_exit_ce_loss
                     if (target_token != -100).any():
-                        latent_exit_ce_loss = self.loss_fct(eot_logits, target_token)
+                        valid_exit = (target_token != -100).sum().item()
+                        latent_exit_ce_loss = self.loss_fct_sum(eot_logits, target_token)
                         ce_loss_total = ce_loss_total + latent_exit_ce_loss
-
+                        ce_token_count += valid_exit
                         if debug:
                             target_decoded = self.tokenizer.decode([target_token[0].item()]) if target_token[0] != -100 else "[masked]"
                             print(f"Latent_exit_ce_loss: {latent_exit_ce_loss.item():.6f}, target='{target_decoded}'")
@@ -1162,72 +1254,7 @@ class CODI(torch.nn.Module):
                     if debug:
                         print(f"\n[DEBUG] Skipping EOT (Latent sequence continues)")
                 
-                # ===== 5. Explain Loss (在每个latent都计算，decoder输入仍包含<eot>作为分隔符) =====
-                if debug:
-                    print(f"\n[DEBUG] >>> EXPLAIN LOSS CALCULATION <<<")
-                    
-                if self.model_args.use_decoder and next_step_ids is not None:
-                    next_step_len = next_step_ids.size(1)
-                    if next_step_len > 0:
-                        if debug:
-                            print(f"\n  Input preparation:")
-                            print(f"    next_step_ids shape: {next_step_ids.shape}")
-                        
-                        next_embds = self.get_embd(self.codi, self.model_name)(next_step_ids)
-                        
-                        # Decoder输入仍然使用 [latent, eot, next_step]，eot作为分隔符
-                        eot_ids_for_decoder = torch.full((batch_size, 1), self.eot_id, dtype=torch.long, device=device)
-                        eot_embd_for_decoder = self.get_embd(self.codi, self.model_name)(eot_ids_for_decoder)
-                        decoder_input = torch.cat([latent_embd, eot_embd_for_decoder, next_embds], dim=1)
-                        
-                        if debug:
-                            print(f"    decoder_input shape: {decoder_input.shape} = [LATENT(1) + EOT(1) + next({next_step_len})]")
-                        
-                        # 构建labels
-                        prefix_placeholder = torch.full((batch_size, 2), -570, dtype=next_step_ids.dtype, device=device)
-                        indices_with_prefix = torch.cat([prefix_placeholder, next_step_ids], dim=1)
-                        
-                        explain_labels = indices_with_prefix.clone()
-                        explain_labels = explain_labels.masked_fill(
-                            (explain_labels == -570) | (explain_labels == model_pad_id),
-                            -100
-                        )
-                        if self.tokenizer.pad_token_id is not None:
-                            explain_labels = explain_labels.masked_fill(explain_labels == self.tokenizer.pad_token_id, -100)
-                        
-                        explain_attention_mask = (indices_with_prefix != model_pad_id) & (indices_with_prefix != -570)
-                        if self.tokenizer.pad_token_id is not None:
-                            explain_attention_mask = explain_attention_mask & (indices_with_prefix != self.tokenizer.pad_token_id)
-                        
-                        if hasattr(self, 'pj_in'):
-                            decoder_input = self.pj_in(decoder_input)
-                        
-                        if (explain_labels != -100).sum() > 0:
-                            with autocast(dtype=torch.bfloat16):
-                                dec_out = self.decoder(
-                                    inputs_embeds=decoder_input,
-                                    attention_mask=explain_attention_mask,
-                                    output_hidden_states=True
-                                )
-                            
-                            dec_logits = dec_out.logits
-                            if hasattr(self, 'pj_out'):
-                                dec_logits = self.pj_out(dec_logits)
-                            
-                            shift_logits = dec_logits[:, :-1, :].contiguous()
-                            shift_labels = explain_labels[:, 1:].contiguous()
-                            
-                            if (shift_labels != -100).sum() > 0:
-                                explain_loss = self.loss_fct(
-                                    shift_logits.reshape(-1, shift_logits.size(-1)),
-                                    shift_labels.reshape(-1)
-                                )
-                                explain_loss_total = explain_loss_total + explain_loss
-                                effective_explain_steps += 1
-                                
-                                if debug:
-                                    print(f"  *** Explain Loss value: {explain_loss.item():.6f} ***")
-                
+
                 # ===== 设置标记：当前步是Latent =====
                 prev_was_latent = True
                 
@@ -1255,10 +1282,14 @@ class CODI(torch.nn.Module):
             if self.tokenizer.pad_token_id is not None:
                 ans_first_token[ans_first_token == self.tokenizer.pad_token_id] = -100
             
+            # if (ans_first_token != -100).any():
+            #     ans_entry_ce_loss = self.loss_fct(current_logits, ans_first_token)
+            #     ce_loss_total = ce_loss_total + ans_entry_ce_loss
             if (ans_first_token != -100).any():
-                ans_entry_ce_loss = self.loss_fct(current_logits, ans_first_token)
+                valid_ans_entry = (ans_first_token != -100).sum().item()
+                ans_entry_ce_loss = self.loss_fct_sum(current_logits, ans_first_token)
                 ce_loss_total = ce_loss_total + ans_entry_ce_loss
-                
+                ce_token_count += valid_ans_entry
                 if debug:
                     target_decoded = self.tokenizer.decode([ans_first_token[0].item()]) if ans_first_token[0] != -100 else "[masked]"
                     print(f"  ★ Answer Entry CE Loss: {ans_entry_ce_loss.item():.6f}, target='{target_decoded}'")
@@ -1290,11 +1321,26 @@ class CODI(torch.nn.Module):
             valid_ans_labels = (ans_labels != -100).sum().item()
             print(f"  valid answer labels: {valid_ans_labels}")
         
-        ans_ce_loss = self.loss_fct(
+        # ans_ce_loss = self.loss_fct(
+        #     ans_logits.reshape(-1, ans_logits.size(-1)),
+        #     ans_labels.reshape(-1)
+        # )
+        # ce_loss_total = ce_loss_total + ans_ce_loss
+        # ce_loss_total = ce_loss_total * self.ce_loss_factor
+        # effective_ce_steps += 1
+
+        valid_ans_tokens = (ans_labels != -100).sum().item()
+        ans_ce_loss = self.loss_fct_sum(
             ans_logits.reshape(-1, ans_logits.size(-1)),
             ans_labels.reshape(-1)
         )
         ce_loss_total = ce_loss_total + ans_ce_loss
+        ce_token_count += valid_ans_tokens
+
+        # 归一化：除以总token数
+        if ce_token_count > 0:
+            ce_loss_total = ce_loss_total / ce_token_count
+
         ce_loss_total = ce_loss_total * self.ce_loss_factor
         effective_ce_steps += 1
         

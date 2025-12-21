@@ -77,10 +77,12 @@ class CustomTrainer(Trainer):
         loss_for_log = loss.detach() if isinstance(loss, torch.Tensor) else loss
         if step % self.args.logging_steps == 0:
             logs = {
-                "loss": _to_scalar(loss_for_log),
+                "loss": _to_scalar(outputs.get("loss")),
                 "ce_loss": _to_scalar(outputs.get("ce_loss")),
                 "distill_loss": _to_scalar(outputs.get("distill_loss")),
                 "ref_ce_loss": _to_scalar(outputs.get("ref_ce_loss")),
+                "explain_loss": _to_scalar(outputs.get("explain_loss")),  # 新增
+                "align_loss": _to_scalar(outputs.get("align_loss")),      # 新增
             }
             if not hasattr(self, "is_global_zero") or self.is_global_zero:
                 self.log(logs)

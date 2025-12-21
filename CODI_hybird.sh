@@ -18,12 +18,11 @@ python step2_train_entropy_predictor.py \
 
 
 
-export CUDA_VISIBLE_DEVICES="4"
-
+export CUDA_VISIBLE_DEVICES="0"
 python step4_adaptive_eval.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive_distill/Llama-3.2-1B-Instruct/ep_3/lr_0.008/seed_11/checkpoint-500 \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive_random_CODI/Llama-3.2-1B-Instruct/ep_5/lr_0.0008/seed_11/checkpoint-500 \
     --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
@@ -33,7 +32,44 @@ python step4_adaptive_eval.py \
     --max_switch_count 5 \
     --window_e_to_l 5 \
     --window_l_to_e 0 \
+    --max_latent_steps 1 
+    
+    \
     --max_samples 50
+
+python step4_adaptive_step2.py \
+    --model_type codi \
+    --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive_random_cot/Llama-3.2-1B-Instruct/ep_5/lr_0.0008/seed_11 \
+    --data_name gsm8k \
+    --bf16 \
+    --batch_size 8 \
+    --baseline_mode adaptive \
+    --prj_dim 2048 \
+    --max_switch_count 5 \
+    --window_e_to_l 0 \
+    --window_l_to_e 0 \
+    --max_latent_steps 1
+
+
+
+export CUDA_VISIBLE_DEVICES="0"
+
+python step4_adaptive_eval.py \
+    --model_type codi \
+    --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_adaptive_random/Llama-3.2-1B-Instruct/ep_5/lr_0.0008/seed_11/checkpoint-5000 \
+    --predictor_path checkpoints/entropy_predictor.pt \
+    --data_name gsm8k \
+    --bf16 \
+    --batch_size 8 \
+    --baseline_mode random \
+    --random_prob 1 \
+    --prj_dim 2048 \
+    --max_switch_count 5 \
+    --window_e_to_l 5 \
+    --window_l_to_e 0 \
+    --max_latent_steps 3
 
 python step4_adaptive_eval.py \
     --model_type codi \

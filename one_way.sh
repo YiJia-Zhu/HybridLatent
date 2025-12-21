@@ -1,23 +1,26 @@
 #!/bin/bash
+# 我基于CODI改进了方法，实现了半显半隐层推理方法，loss计算的对齐方法都参考官方实现，仅仅范式变为了半显半隐（核心./CODI/src/model_adaptive.py）。目前我one_way.sh训练出来的模型，理论上应该就是一般的CoT - SFT？应该和我训练数据的格式<<3+4=7>> <<16-7=9>>The answer is: 18这样一致，但是为什么是“## Step 1: Calculate the number of eggs ”但是这里为什么推理结果是这样貌似和没有训练的llama格式一致？
+# 帮我看看CODI官方怎么搞的/mnt/8T/xgr/zhuyijia/SIM-CoT/CODI/src/model.py为什么他们可以训练成功？
+
+
 
 # ========== 配置变量 ==========
-EXPT_NAME="gsm8k_llama1b_adaptive_distill"
-BASE_DIR="/storage/zyj_data/swilatent/SIM-CoT"
-SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
+EXPT_NAME="gsm8k_llama1b_cot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
+SAVE_DIR="${SAVE_DIR:-$BASE_DIR/CODI/ckpts}"
 
 # 训练参数（用于构建 CKPT_DIR 路径）
 MODEL_NAME="Llama-3.2-1B-Instruct"
-NUM_EPOCHS=3
-LEARNING_RATE=0.008
+NUM_EPOCHS=10
+LEARNING_RATE=0.0008
 SEED=11
 
 # 自动构建 CKPT_DIR
-# CKPT_DIR="${SAVE_DIR}/${EXPT_NAME}/${MODEL_NAME}/ep_${NUM_EPOCHS}/lr_${LEARNING_RATE}/seed_${SEED}"
+CKPT_DIR="${SAVE_DIR}/${EXPT_NAME}/${MODEL_NAME}/ep_${NUM_EPOCHS}/lr_${LEARNING_RATE}/seed_${SEED}"
 
-CKPT_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/pretrained/SIM_COT-LLaMA3-CODI-1B"
-
-# GPU 列表
-GPUS=(5 1 2)
+# GPU 配置（单卡）
+GPU=1
 
 # ========== 日志配置 ==========
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -25,53 +28,35 @@ LOG_DIR="${SAVE_DIR}/logs_${TIMESTAMP}"
 mkdir -p "$LOG_DIR"
 cp "$0" "$LOG_DIR/run_script.sh"
 
-TRAIN_LOG="${LOG_DIR}/train_gpu${GPUS[0]}.log"
-TEST_LATENT_LOG="${LOG_DIR}/test_latent_gpu${GPUS[0]}.log"
-TEST_COT_LOG="${LOG_DIR}/test_cot_gpu${GPUS[1]}.log"
-TEST_ADAPTIVE_LOG="${LOG_DIR}/test_adaptive_gpu${GPUS[2]}.log"
+
+TRAIN_LOG="${LOG_DIR}/train_gpu${GPU}.log"
+TEST_LATENT_LOG="${LOG_DIR}/test_latent_gpu${GPU}.log"
+TEST_COT_LOG="${LOG_DIR}/test_cot_gpu${GPU}.log"
+TEST_ADAPTIVE_LOG="${LOG_DIR}/test_adaptive_gpu${GPU}.log"
 
 echo "Logs will be saved to: $LOG_DIR"
 
-# ========== 信号处理：Ctrl+C 时终止所有子进程 ==========
-PIDS=()
-
+# ========== 信号处理：Ctrl+C 时终止 ==========
 cleanup() {
     echo ""
     echo "=========================================="
     echo "Caught interrupt signal! Cleaning up..."
     echo "=========================================="
-    
-    # 终止所有记录的子进程
-    for pid in "${PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "Killing process $pid..."
-            kill -TERM "$pid" 2>/dev/null
-            # 等待一小段时间后强制杀死
-            sleep 1
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null
-            fi
-        fi
-    done
-    
-    # 同时杀掉所有同组的子进程（更彻底）
     pkill -P $$ 2>/dev/null
-    
-    echo "All processes terminated."
+    echo "Process terminated."
     echo "Partial logs saved in: $LOG_DIR"
     exit 1
 }
 
-# 捕获 SIGINT (Ctrl+C), SIGTERM, SIGHUP
 trap cleanup SIGINT SIGTERM SIGHUP
 
-# ========== Training (使用1个GPU) ==========
-echo "Starting Training on GPU ${GPUS[0]}..."
+# ========== Training ==========
+echo "Starting Training on GPU ${GPU}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-# CUDA_VISIBLE_DEVICES="${GPUS[0]}" python train_adaptive.py \
-CUDA_VISIBLE_DEVICES="1,2,4,5" torchrun --nproc_per_node=4 --master_port 29501 train_adaptive.py \
+# CUDA_VISIBLE_DEVICES="0,1" torchrun --nproc_per_node=2 train_adaptivate.py \
+CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29501 train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -81,7 +66,7 @@ CUDA_VISIBLE_DEVICES="1,2,4,5" torchrun --nproc_per_node=4 --master_port 29501 t
     --seed ${SEED} \
     --model_max_length 512 \
     --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 4 \
     --bf16 \
     --num_train_epochs ${NUM_EPOCHS} \
     --learning_rate ${LEARNING_RATE} \
@@ -89,15 +74,15 @@ CUDA_VISIBLE_DEVICES="1,2,4,5" torchrun --nproc_per_node=4 --master_port 29501 t
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --save_strategy "steps" \
-    --save_steps 500 \
-    --save_total_limit 10 \
+    --save_steps 10 \
+    --save_total_limit 30 \
     --save_safetensors False \
     --weight_decay 0.1 \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --do_train \
     --report_to tensorboard \
-    --num_latent 11 \
+    --num_latent 6 \
     --logging_strategy "steps" \
     --use_prj True \
     --prj_dim 2048 \
@@ -107,23 +92,24 @@ CUDA_VISIBLE_DEVICES="1,2,4,5" torchrun --nproc_per_node=4 --master_port 29501 t
     --max_token_num 200 \
     --remove_eos True \
     --adaptive_training True\
-    --window_e_to_l 0 \
+    --window_e_to_l 5 \
     --window_l_to_e 0 \
-    --baseline_mode random --random_prob 0.5 \
-    --use_decoder \
-    --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 1 --align_loss_factor 20 --distill_loss_factor 20 \
-    --restore_from /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
+    --exp_mode True \
+    --exp_data_num 1000 \
+    --baseline_mode random \
+    --random_prob 1 \
+    --ce_loss_factor 1 --ref_loss_factor 0 --explain_loss_factor 0 --align_loss_factor 0 --distill_loss_factor 0 \
     2>&1 | tee "$TRAIN_LOG"
 
-    
-
-
-
-    # --restore_from ./ckpts/sft_cot_llama1b/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/pytorch_model.bin \
     # --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
+    # --use_adaptive_loss False \
+    # --adaptive_loss_factor 5.0 \
+    # --adaptive_window_e_to_l 5 \
+    # --adaptive_window_l_to_e 0 \
+    # --adaptive_loss_type smooth_l1 \
+    # 
 
-    # --hybrid_cot_only_ratio 1 \
-
+# --hybrid_cot_only_ratio 1 \
 # 检查训练是否成功
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     echo "Training failed! Check log: $TRAIN_LOG"
@@ -131,45 +117,36 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 echo "Training completed!"
 
-# ========== 并行测试 (3个GPU并行运行) ==========
+# ========== Resolve checkpoint for eval ==========
+# `train_adaptive.py` saves weights under `checkpoint-*/pytorch_model.bin` during training.
+# If the run finishes cleanly it may also save to `$CKPT_DIR`, but when interrupted only
+# the step checkpoints exist.
+CKPT_FOR_EVAL="$CKPT_DIR"
+if [ ! -f "$CKPT_FOR_EVAL/pytorch_model.bin" ]; then
+    LATEST_CKPT="$(ls -d "$CKPT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1)"
+    if [ -n "$LATEST_CKPT" ] && [ -f "$LATEST_CKPT/pytorch_model.bin" ]; then
+        CKPT_FOR_EVAL="$LATEST_CKPT"
+    fi
+fi
+if [ ! -f "$CKPT_FOR_EVAL/pytorch_model.bin" ]; then
+    echo "ERROR: No usable checkpoint found under: $CKPT_DIR" >&2
+    echo "Hint: expected either '$CKPT_DIR/pytorch_model.bin' or '$CKPT_DIR/checkpoint-*/pytorch_model.bin'." >&2
+    exit 1
+fi
+echo "Using checkpoint for evaluation: $CKPT_FOR_EVAL"
+
+# ========== 串行测试 ==========
 echo ""
 echo "=========================================="
-echo "Starting parallel testing..."
+echo "Starting sequential testing on GPU ${GPU}..."
 echo "=========================================="
 
-# # Test Latent (GPU 0)
-# echo "Test Latent on GPU ${GPUS[0]}... Log: $TEST_LATENT_LOG"
-# CUDA_VISIBLE_DEVICES="${GPUS[0]}" python test.py \
-#     --data_name "gsm8k" \
-#     --output_dir "$SAVE_DIR" \
-#     --model_name_or_path ./pretrained/${MODEL_NAME} \
-#     --seed ${SEED} \
-#     --model_max_length 512 \
-#     --bf16 \
-#     --lora_r 128 --lora_alpha 32 --lora_init \
-#     --batch_size 128 \
-#     --greedy True \
-#     --num_latent 6 \
-#     --use_prj True \
-#     --prj_dim 2048 \
-#     --prj_no_ln False \
-#     --prj_dropout 0.0 \
-#     --inf_latent_iterations 6 \
-#     --inf_num_iterations 1 \
-#     --remove_eos True \
-#     --use_lora True \
-#     --ckpt_dir "$CKPT_DIR" \
-#     2>&1 | tee "$TEST_LATENT_LOG" &
-# PID1=$!
-# PIDS+=($PID1)
-
-# Test CoT (GPU 1)
 cd ${BASE_DIR}
-echo "Test CoT on GPU ${GPUS[1]}... Log: $TEST_COT_LOG"
-CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_eval.py \
+
+python step4_adaptive_step.py \
     --model_type codi \
-    --base_model_path ./CODI/pretrained/${MODEL_NAME} \
-    --ckpt_dir "$CKPT_DIR" \
+    --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+    --ckpt_dir "$CKPT_FOR_EVAL" \
     --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
@@ -177,56 +154,9 @@ CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_eval.py \
     --baseline_mode random \
     --random_prob 1 \
     --prj_dim 2048 \
-    --max_switch_count 5 \
+    --max_switch_count 0 \
     --window_e_to_l 256 \
     --window_l_to_e 0 \
-    2>&1 | tee "$TEST_COT_LOG" &
-PID2=$!
-PIDS+=($PID2)
+    --max_latent 0 \
+    --max_samples 50
 
-# Test Adaptive (GPU 2)
-echo "Test Adaptive on GPU ${GPUS[2]}... Log: $TEST_ADAPTIVE_LOG"
-CUDA_VISIBLE_DEVICES="${GPUS[2]}" python step4_adaptive_eval.py \
-    --model_type codi \
-    --base_model_path ./CODI/pretrained/${MODEL_NAME} \
-    --ckpt_dir "$CKPT_DIR" \
-    --predictor_path checkpoints/entropy_predictor.pt \
-    --data_name gsm8k \
-    --bf16 \
-    --batch_size 8 \
-    --baseline_mode adaptive \
-    --prj_dim 2048 \
-    --max_switch_count 5 \
-    --window_e_to_l 5 \
-    --window_l_to_e 0 \
-    2>&1 | tee "$TEST_ADAPTIVE_LOG" &
-PID3=$!
-PIDS+=($PID3)
-
-# 等待所有并行任务完成
-echo ""
-echo "Waiting for all tests to complete..."
-echo "Running PIDs: ${PIDS[*]}"
-
-# wait $PID1
-# STATUS1=$?
-# echo "Test Latent completed! (exit code: $STATUS1)"
-
-wait $PID2
-STATUS2=$?
-echo "Test CoT completed! (exit code: $STATUS2)"
-
-wait $PID3
-STATUS3=$?
-echo "Test Adaptive completed! (exit code: $STATUS3)"
-
-echo ""
-echo "=========================================="
-echo "All experiments finished!"
-echo "=========================================="
-echo ""
-echo "Log files saved in: $LOG_DIR"
-echo "  - Training:      $TRAIN_LOG"
-echo "  - Test Latent:   $TEST_LATENT_LOG"
-echo "  - Test CoT:      $TEST_COT_LOG"
-echo "  - Test Adaptive: $TEST_ADAPTIVE_LOG"

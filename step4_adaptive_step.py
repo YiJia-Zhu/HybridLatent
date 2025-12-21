@@ -67,211 +67,8 @@ from coconut import Coconut
 # 导入 CODI
 from model import CODI, ModelArguments, TrainingArguments
 
-# 导入熵预测器
-from entropy_predictor import EntropyPredictor, compute_entropy_swir
+from Swicontrol import EntropyPredictor, compute_entropy_swir, TimeStats, SwiRModeState, SwiRController, AdaptiveController
 
-
-# ============================================================================
-# 时间统计器
-# ============================================================================
-
-@dataclass
-class TimeStats:
-    """时间统计"""
-    normal_time: float = 0.0
-    soft_time: float = 0.0
-    normal_steps: int = 0
-    soft_steps: int = 0
-    
-    def add_normal(self, duration: float):
-        self.normal_time += duration
-        self.normal_steps += 1
-    
-    def add_soft(self, duration: float):
-        self.soft_time += duration
-        self.soft_steps += 1
-    
-    def get_avg_normal(self) -> float:
-        return self.normal_time / self.normal_steps if self.normal_steps > 0 else 0
-    
-    def get_avg_soft(self) -> float:
-        return self.soft_time / self.soft_steps if self.soft_steps > 0 else 0
-    
-    def merge(self, other: 'TimeStats'):
-        self.normal_time += other.normal_time
-        self.soft_time += other.soft_time
-        self.normal_steps += other.normal_steps
-        self.soft_steps += other.soft_steps
-
-
-# ============================================================================
-# SwiReasoning 风格的模式状态和控制器
-# ============================================================================
-
-@dataclass
-class SwiRModeState:
-    """SwiReasoning 风格的模式状态"""
-    mode: torch.Tensor
-    mode_stay_steps: torch.Tensor
-    ref_entropy: torch.Tensor
-    locked_normal: torch.Tensor
-    switch_count: torch.Tensor
-    answer_locked: torch.Tensor
-    
-    @classmethod
-    def init(cls, batch_size: int, device: torch.device):
-        return cls(
-            mode=torch.zeros(batch_size, dtype=torch.long, device=device),
-            mode_stay_steps=torch.zeros(batch_size, dtype=torch.long, device=device),
-            ref_entropy=torch.zeros(batch_size, dtype=torch.float, device=device),
-            locked_normal=torch.zeros(batch_size, dtype=torch.bool, device=device),
-            switch_count=torch.zeros(batch_size, dtype=torch.long, device=device),
-            answer_locked=torch.zeros(batch_size, dtype=torch.bool, device=device),
-        )
-
-
-class SwiRController:
-    """SwiReasoning 风格的模式切换控制器"""
-    
-    def __init__(
-        self,         
-        window_e_to_l: int = 5,
-        window_l_to_e: int = 0,
-        max_switch_count: Optional[int] = None
-        ):
-        self.window_e_to_l = window_e_to_l
-        self.window_l_to_e = window_l_to_e
-        self.max_switch_count = max_switch_count
-    
-    def update(
-        self,
-        state: SwiRModeState,
-        cur_entropy: torch.Tensor,
-        step: int,
-        end_token_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[SwiRModeState, torch.Tensor, torch.Tensor]:
-        """更新模式状态"""
-        device = cur_entropy.device
-        batch_size = cur_entropy.shape[0]
-        
-        if end_token_mask is not None:
-            state.locked_normal = state.locked_normal | end_token_mask
-        
-        if state.answer_locked.any():
-            state.mode = torch.where(state.answer_locked, torch.ones_like(state.mode), state.mode)
-            to_normal = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            to_soft = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            return state, to_normal, to_soft
-
-        if step == 0:
-            state.ref_entropy = cur_entropy.clone()
-            to_normal = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            to_soft = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        else:
-            state.mode_stay_steps += 1
-            allow_l_to_e = (state.mode_stay_steps >= self.window_l_to_e)
-            allow_e_to_l = (state.mode_stay_steps >= self.window_e_to_l)
-            
-            to_normal = (state.mode == 0) & (cur_entropy < state.ref_entropy) & allow_l_to_e
-            to_soft = (state.mode == 1) & (cur_entropy > state.ref_entropy) & allow_e_to_l & (~state.locked_normal)
-
-            state.mode = torch.where(to_normal, torch.ones_like(state.mode), state.mode)
-            state.mode = torch.where(to_soft, torch.zeros_like(state.mode), state.mode)
-            switched = to_normal | to_soft
-            state.mode_stay_steps = torch.where(switched, torch.zeros_like(state.mode_stay_steps), state.mode_stay_steps)
-            state.ref_entropy = torch.where(switched, cur_entropy, state.ref_entropy)
-
-            if self.max_switch_count is not None:
-                state.switch_count = state.switch_count + switched.long()
-                limit_reached = (state.switch_count >= self.max_switch_count)
-                state.mode = torch.where(limit_reached, torch.ones_like(state.mode), state.mode)
-                state.locked_normal = state.locked_normal | limit_reached
-        
-        return state, to_normal, to_soft
-    
-
-class AdaptiveController:
-    """结合 EntropyPredictor 和 SwiRController 的自适应控制器"""
-    
-    def __init__(
-        self,
-        entropy_predictor: Optional[EntropyPredictor],
-        window_e_to_l: int = 5,
-        window_l_to_e: int = 0,
-        max_switch_count: Optional[int] = None,
-        use_predicted_entropy: bool = True,
-        baseline_mode: str = "adaptive",
-        random_prob: float = 0.5,
-    ):
-        self.predictor = entropy_predictor
-        self.controller = SwiRController(window_e_to_l=window_e_to_l, window_l_to_e=window_l_to_e, max_switch_count=max_switch_count)
-        self.use_predicted_entropy = use_predicted_entropy
-        self.state = None
-        
-        self.baseline_mode = baseline_mode
-        self.random_prob = random_prob
-        self.is_initialized = False
-        
-    def init_state(self, batch_size: int, device: torch.device):
-        """初始化模式状态"""
-        self.state = SwiRModeState.init(batch_size, device)
-        self.is_initialized = True
-        return self.state
-    
-    def get_entropy(self, hidden_states: torch.Tensor, logits: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.use_predicted_entropy and self.predictor is not None:
-            with torch.no_grad():
-                predicted = self.predictor(hidden_states)
-            return predicted.squeeze(-1)
-        else:
-            if logits is None:
-                raise ValueError("logits required when use_predicted_entropy=False")
-            return compute_entropy_swir(logits)
-    
-    def step(
-        self,
-        hidden_states: torch.Tensor,
-        step: int,
-        logits: Optional[torch.Tensor] = None,
-        end_token_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """更新模式状态并返回当前模式、切换事件和熵"""
-        if self.state is None:
-            self.init_state(hidden_states.shape[0], hidden_states.device)
-            
-        device = hidden_states.device
-        batch_size = hidden_states.shape[0]
-        
-        if self.baseline_mode == "random":
-            if step == 0 and self.is_initialized:
-                random_values = torch.rand(batch_size, device=device)
-                self.state.mode = (random_values < self.random_prob).long()
-                
-            random_switch = torch.rand(batch_size, device=device)
-            
-            to_normal_new = (random_switch < self.random_prob) & (self.state.mode == 0)
-            to_soft_new = (random_switch >= self.random_prob) & (self.state.mode == 1) & (~self.state.locked_normal)
-            
-            mode = self.state.mode.clone()
-            mode = torch.where(to_normal_new, torch.ones_like(mode), mode)
-            mode = torch.where(to_soft_new, torch.zeros_like(mode), mode)
-            
-            self.state.mode = mode
-            
-            to_normal = to_normal_new
-            to_soft = to_soft_new
-            cur_entropy = torch.zeros(batch_size, dtype=torch.float, device=device) 
-            
-            return mode, to_normal, to_soft, cur_entropy
-        
-        elif self.baseline_mode == "adaptive":
-            cur_entropy = self.get_entropy(hidden_states, logits)
-            self.state, to_normal, to_soft = self.controller.update(self.state, cur_entropy, step, end_token_mask)
-            
-            return self.state.mode.clone(), to_normal, to_soft, cur_entropy
-        
-        else:
-            raise ValueError(f"Unknown baseline_mode: {self.baseline_mode}")
 
 
 # ============================================================================
@@ -611,6 +408,7 @@ def load_coconut_model(
 # CODI 自适应生成 (带时间统计)
 # ============================================================================
 
+
 def codi_adaptive_generate_with_timing(
     model: CODI,
     tokenizer,
@@ -624,11 +422,17 @@ def codi_adaptive_generate_with_timing(
     answer_triggers: List[str] = None,
     max_latent_steps: int = 6,
     random_prob: float = 0.5,
+    # ===== 新增参数 =====
+    step_start_ids: Tuple[int, ...] = (2501, 1134),  # << 的 token IDs
+    step_end_id: int = 2511,  # >> 的 token ID
 ) -> Tuple[Dict, TimeStats]:
-    """修正版：只有进入 latent 时才插入 bot，退出时插入 eot"""
+    """
+    修正版：保证每个 Latent 区域 <bot>LLL<eot> 结构完整
+    新增：只在 step 边界（>> 之后）才允许从 normal 切换到 latent
+    """
     
     if answer_triggers is None:
-        answer_triggers = ["The answer is", "#### ", "the answer is", "Answer:",]
+        answer_triggers = ["The answer is", "#### ", "the answer is", "Answer:"]
     
     if device is None:
         device = next(model.parameters()).device
@@ -638,12 +442,6 @@ def codi_adaptive_generate_with_timing(
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     batch_size = input_ids.shape[0]
-    
-    # ========== 删除这部分 ==========
-    # bot_tensor = torch.tensor([[model.bot_id]], dtype=torch.long, device=device).expand(batch_size, 1)
-    # input_ids = torch.cat([input_ids, bot_tensor], dim=1)
-    # attention_mask = torch.cat([attention_mask, torch.ones_like(bot_tensor)], dim=1)
-    # ================================
     
     controller.init_state(batch_size, device)
     
@@ -655,11 +453,51 @@ def codi_adaptive_generate_with_timing(
     generated_text_buffer = [""] * batch_size
     consecutive_latent_count = 0
     
+    # ========== 关键状态：追踪是否在 Latent 区域内 ==========
+    in_latent_region = False
+    
+    # ========== 新增：追踪是否在 step 内部 (<<...>> 之间) ==========
+    in_step = False
+    
     def get_embd(token_ids):
         return model.get_embd(model.codi, model.model_name)(token_ids)
     
+    # 预计算 bot 和 eot embeddings
+    bot_emb = get_embd(torch.tensor([model.bot_id], device=device)).unsqueeze(0).expand(batch_size, -1, -1)
+    eot_emb = get_embd(torch.tensor([model.eot_id], device=device)).unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # ========== 辅助函数：插入 <bot> ==========
+    def insert_bot(past_kv):
+        nonlocal in_latent_region
+        with torch.no_grad():
+            out = model.codi(
+                inputs_embeds=bot_emb,
+                use_cache=True,
+                output_hidden_states=True,
+                past_key_values=past_kv,
+            )
+        in_latent_region = True
+        if verbose:
+            print(f"  [INSERT] <bot> token")
+        return out.past_key_values, out.hidden_states[-1][:, -1, :]
+    
+    # ========== 辅助函数：插入 <eot> ==========
+    def insert_eot(past_kv):
+        nonlocal in_latent_region
+        with torch.no_grad():
+            out = model.codi(
+                inputs_embeds=eot_emb,
+                use_cache=True,
+                output_hidden_states=True,
+                past_key_values=past_kv,
+            )
+        in_latent_region = False
+        if verbose:
+            print(f"  [INSERT] <eot> token")
+        return out.past_key_values, out.hidden_states[-1][:, -1, :], out.logits[:, -1, :]
+    
+    # ========== 1. Encode 问题 ==========
     past_key_values = None
-    # encode the question
     with torch.no_grad():
         outputs = model.codi(
             input_ids=input_ids,
@@ -671,53 +509,60 @@ def codi_adaptive_generate_with_timing(
         last_hidden = outputs.hidden_states[-1][:, -1, :]
     
     logits = outputs.logits[:, -1, :model.codi.config.vocab_size - 1]
-    mode, to_normal, to_soft, cur_entropy = controller.step(last_hidden, 0, logits)
+    
+    # ========== 2. 初始模式判断 ==========
+    # 初始时允许切换（还没开始生成 step）
+    at_step_boundary = torch.ones(batch_size, dtype=torch.bool, device=device)
+    mode, to_normal, to_soft, cur_entropy = controller.step(last_hidden, 0, logits, at_step_boundary=at_step_boundary)
     current_mode = "normal" if mode[0].item() == 1 else "soft"
+    
+    if verbose:
+        print(f"[Init] Initial mode: {current_mode}, entropy: {cur_entropy[0].item():.4f}")
+    
+    # 如果初始就是 soft 模式，先插入 <bot>
+    if current_mode == "soft":
+        past_key_values, last_hidden = insert_bot(past_key_values)
     
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
     pred_tokens = [[] for _ in range(batch_size)]
     
-    # 预计算 bot 和 eot embeddings
-    bot_emb = get_embd(torch.tensor([model.bot_id], device=device)).unsqueeze(0).expand(batch_size, -1, -1)
-    eot_emb = get_embd(torch.tensor([model.eot_id], device=device)).unsqueeze(0).expand(batch_size, -1, -1)
-    
-    next_input_embd = get_embd(torch.argmax(logits, dim=-1)).unsqueeze(1).to(device)
-    
-    # ========== 新增：如果初始就是 soft 模式，先插入 bot ==========
-    if current_mode == "soft":
-        with torch.no_grad():
-            out = model.codi(
-                inputs_embeds=bot_emb,
-                use_cache=True,
-                output_hidden_states=True,
-                past_key_values=past_key_values,
-            )
-            past_key_values = out.past_key_values
-            last_hidden = out.hidden_states[-1][:, -1, :]
-        if verbose:
-            print(f"[Init] Starting in soft mode, inserted bot_token")
-    # ============================================================
-
+    # ========== 3. 生成循环 ==========
     for step in range(max_new_tokens):
         start_time = time.perf_counter()
         
+        # ========== 3.1 检查是否需要强制退出 Latent 区域 ==========
+        force_exit_latent = False
         if current_mode == "soft" and consecutive_latent_count >= max_latent_steps:
+            force_exit_latent = True
+            if verbose:
+                print(f"[Step {step}] Max latent steps ({max_latent_steps}) reached, forcing exit")
+        
+        # 如果强制退出，先插入 <eot>
+        if force_exit_latent and in_latent_region:
+            past_key_values, last_hidden, logits = insert_eot(past_key_values)
             current_mode = "normal"
             controller.state.mode[0] = 1
+            controller.state.mode_stay_steps[0] = 0
+            controller.state.ref_entropy[0] = cur_entropy[0]
             consecutive_latent_count = 0
-
-            if verbose:
-                print(f"[Step {step}] Max latent steps ({max_latent_steps}) reached, forcing normal mode")
+            switch_events.append((step, "soft->normal (forced)", cur_entropy[0].item()))
         
+        # ========== 3.2 根据当前模式执行推理 ==========
         with torch.no_grad():
             if current_mode == "soft":
-                # decode the latent embeddings
+                # Latent 模式：使用 hidden state 作为输入
                 if use_prj and hasattr(model, 'prj'):
                     input_embd = model.prj(last_hidden.unsqueeze(1))
                 else:
                     input_embd = last_hidden.unsqueeze(1)
             else:
-                input_embd = next_input_embd
+                # Normal 模式：使用 token embedding
+                if greedy:
+                    next_token_ids = torch.argmax(logits, dim=-1)
+                else:
+                    probs = F.softmax(logits / 0.1, dim=-1)
+                    next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                input_embd = get_embd(next_token_ids).unsqueeze(1)
             
             out = model.codi(
                 inputs_embeds=input_embd,
@@ -731,38 +576,41 @@ def codi_adaptive_generate_with_timing(
         step_time = time.perf_counter() - start_time
         logits = out.logits[:, -1, :model.codi.config.vocab_size - 1]
         
-        if greedy:
-            next_token_ids = torch.argmax(logits, dim=-1)
-        else:
-            probs = F.softmax(logits / 0.1, dim=-1)
-            next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        
+        # ========== 3.3 记录时间统计 ==========
         if current_mode == "normal":
             time_stats.add_normal(step_time)
         else:
             time_stats.add_soft(step_time)
         
-        end_token_mask = (next_token_ids == tokenizer.eos_token_id)
-        mode, to_normal, to_soft, cur_entropy = controller.step(
-            last_hidden, step + 1, logits, end_token_mask
-        )
-        
+        # ========== 3.4 处理 Normal 模式的 token 生成 ==========
         if current_mode == "normal":
             consecutive_latent_count = 0
+            
+            # ===== 新增：检测 step 边界 =====
+            token_id = next_token_ids[0].item()
+            if token_id in step_start_ids:
+                in_step = True
+                if verbose:
+                    print(f"[Step {step}] Detected step start '<<', in_step=True")
+            elif token_id == step_end_id:
+                in_step = False
+                if verbose:
+                    print(f"[Step {step}] Detected step end '>>', in_step=False")
+            # ================================
             
             for b in range(batch_size):
                 if not finished[b]:
                     token_text = tokenizer.decode([next_token_ids[b].item()])
                     generated_text_buffer[b] += token_text
                     
+                    # 检查答案触发
                     if not controller.state.answer_locked[b]:
                         for trigger in answer_triggers:
                             if trigger in generated_text_buffer[b]:
                                 controller.state.answer_locked[b] = True
                                 controller.state.mode[b] = 1
-                                mode[b] = 1
                                 if verbose:
-                                    print(f"[Step {step}] Answer trigger '{trigger}' detected, locking normal mode")
+                                    print(f"[Step {step}] Answer trigger '{trigger}' detected")
                                 break
                     
                     pred_tokens[b].append(next_token_ids[b].item())
@@ -775,60 +623,80 @@ def codi_adaptive_generate_with_timing(
                 "mode": current_mode,
                 "entropy": cur_entropy[0].item(),
                 "answer_locked": controller.state.answer_locked[0].item(),
+                "in_step": in_step,  # 新增：记录是否在 step 内
             })
         else:
+            # Latent 模式
             consecutive_latent_count += 1
-            
             generated_tokens.append({
                 "token_id": -1,
                 "token_text": "<latent>",
                 "mode": current_mode,
                 "entropy": cur_entropy[0].item(),
                 "answer_locked": controller.state.answer_locked[0].item(),
+                "in_step": in_step,  # 新增
             })
-        
-        # ========== 修改：处理模式切换时的特殊 token ==========
-        if to_normal[0].item():
-            # soft -> normal: 插入 eot_token
-            next_input_embd = eot_emb
-            switch_events.append((step, "soft->normal", cur_entropy[0].item()))
-            if verbose:
-                print(f"[Step {step}] soft->normal, inserting eot_token")
-        elif to_soft[0].item():
-            # normal -> soft: 插入 bot_token，然后进行一次前向传播
-            switch_events.append((step, "normal->soft", cur_entropy[0].item()))
-            if verbose:
-                print(f"[Step {step}] normal->soft, inserting bot_token")
-            
-            with torch.no_grad():
-                out = model.codi(
-                    inputs_embeds=bot_emb,
-                    use_cache=True,
-                    output_hidden_states=True,
-                    past_key_values=past_key_values,
-                )
-                past_key_values = out.past_key_values
-                last_hidden = out.hidden_states[-1][:, -1, :]
-            # soft 模式下不需要设置 next_input_embd，因为会用 last_hidden
-        else:
-            next_input_embd = get_embd(next_token_ids).unsqueeze(1)
-        # ====================================================
         
         token_modes.append(current_mode)
         token_entropies.append(cur_entropy[0].item())
         
+        # ========== 3.5 检查是否结束 ==========
+        if finished.all():
+            # 如果在 Latent 区域内结束，插入 <eot>
+            if in_latent_region:
+                past_key_values, last_hidden, logits = insert_eot(past_key_values)
+                switch_events.append((step, "soft->normal (end)", cur_entropy[0].item()))
+            break
+        
+        # ========== 3.6 更新模式（基于当前输出） ==========
+        end_token_mask = None
+        if current_mode == "normal":
+            end_token_mask = (next_token_ids == tokenizer.eos_token_id)
+        
+        old_mode = current_mode
+        
+        # ===== 新增：计算 at_step_boundary =====
+        # 只有在 step 外（in_step=False）才允许从 normal 切换到 latent
+        at_step_boundary = torch.tensor([not in_step], dtype=torch.bool, device=device)
+        if batch_size > 1:
+            at_step_boundary = at_step_boundary.expand(batch_size)
+        # =======================================
+        
+        mode, to_normal, to_soft, cur_entropy = controller.step(
+            last_hidden, step + 1, logits, end_token_mask, at_step_boundary
+        )
+        
+        # ========== 3.7 处理模式切换 ==========
+        # soft -> normal: 需要插入 <eot>
+        if to_normal[0].item() and in_latent_region:
+            past_key_values, last_hidden, logits = insert_eot(past_key_values)
+            switch_events.append((step, "soft->normal", cur_entropy[0].item()))
+            if verbose:
+                print(f"[Step {step}] soft->normal, entropy: {cur_entropy[0].item():.4f}")
+        
+        # normal -> soft: 需要插入 <bot>
+        if to_soft[0].item() and not in_latent_region:
+            past_key_values, last_hidden = insert_bot(past_key_values)
+            switch_events.append((step, "normal->soft", cur_entropy[0].item()))
+            if verbose:
+                print(f"[Step {step}] normal->soft, entropy: {cur_entropy[0].item():.4f}, at_step_boundary: {at_step_boundary[0].item()}")
+        
+        # ========== 3.8 决定下一步模式 ==========
         if controller.state.answer_locked[0]:
-            next_mode = "normal"
-        elif consecutive_latent_count >= max_latent_steps:
             next_mode = "normal"
         else:
             next_mode = "normal" if mode[0].item() == 1 else "soft"
         
         current_mode = next_mode
-        
-        if finished.all():
-            break
     
+    # ========== 4. 循环结束后，确保 Latent 区域闭合 ==========
+    if in_latent_region:
+        past_key_values, last_hidden, logits = insert_eot(past_key_values)
+        switch_events.append((max_new_tokens, "soft->normal (final)", cur_entropy[0].item()))
+        if verbose:
+            print(f"[Final] Closing latent region with <eot>")
+    
+    # ========== 5. 生成结果 ==========
     output_text = tokenizer.decode(pred_tokens[0], skip_special_tokens=True)
     
     mode_counts = {"normal": 0, "soft": 0}
@@ -850,46 +718,21 @@ def codi_adaptive_generate_with_timing(
 # Coconut 自适应生成 (修复版 - 带时间统计)
 # ============================================================================
 
-"""
-Coconut 自适应生成 - 修复版
-
-参考:
-1. CODI 中 codi_adaptive_generate_with_timing 的 bot/eot 处理逻辑
-2. Coconut 官方代码的 generate 方法
-"""
-
-import torch
-import torch.nn.functional as F
-import time
-from typing import Tuple, List, Optional, Dict
-from dataclasses import dataclass
-
-
-
 def coconut_adaptive_generate_with_timing(
-    model,  # Coconut model
+    model: Coconut,
     tokenizer,
-    controller,  # AdaptiveController
+    controller: AdaptiveController,
     input_text: str,
     max_new_tokens: int = 256,
     max_latent_steps: int = 6,
     device: torch.device = None,
     verbose: bool = False,
     answer_triggers: List[str] = None,
-    greedy: bool = True,
 ) -> Tuple[Dict, TimeStats]:
     """
     Coconut 自适应生成 (修复版)
     
-    参考 CODI 的 bot/eot 处理逻辑:
-    - 初始如果是 soft 模式，先插入 start_id (bot)
-    - soft -> normal: 插入 end_id (eot)
-    - normal -> soft: 插入 start_id (bot) 并做一次前向传播
-    
-    Coconut 特殊 token:
-    - start_id: <|start-latent|> (对应 CODI 的 bot)
-    - end_id: <|end-latent|> (对应 CODI 的 eot)
-    - latent_id: <|latent|> (latent placeholder)
+    参考官方 Coconut 的 generate 方法实现
     """
     if answer_triggers is None:
         answer_triggers = ["####", "The answer is", "the answer is"]
@@ -899,26 +742,9 @@ def coconut_adaptive_generate_with_timing(
     
     time_stats = TimeStats()
     
-    # 获取 Coconut 的特殊 token IDs
-    start_id = model.start_id  # bot
-    end_id = model.end_id      # eot
-    latent_id = model.latent_id
-    eos_id = model.eos_id
-    
-    # 获取 embedding 函数
-    def get_embedding(token_ids):
-        """获取 token embedding"""
-        if hasattr(model, 'embedding'):
-            return model.embedding(token_ids)
-        elif hasattr(model.base_causallm, 'get_input_embeddings'):
-            return model.base_causallm.get_input_embeddings()(token_ids)
-        else:
-            return model.base_causallm.transformer.wte(token_ids)
-    
     # 1. Tokenize 输入
     inputs = tokenizer(input_text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids)).to(device)
     batch_size = input_ids.shape[0]
     
     assert batch_size == 1, "Coconut currently only supports batch_size == 1"
@@ -934,97 +760,85 @@ def coconut_adaptive_generate_with_timing(
     generated_text_buffer = ""
     consecutive_latent_count = 0
     
-    # 预计算 start (bot) 和 end (eot) 的 embeddings
-    start_emb = get_embedding(torch.tensor([start_id], device=device)).unsqueeze(0)  # [1, 1, hidden_dim]
-    end_emb = get_embedding(torch.tensor([end_id], device=device)).unsqueeze(0)      # [1, 1, hidden_dim]
+    # 3. 初始前向传播 (处理输入)
+    labels = input_ids.clone()
+    position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=device).reshape(1, -1)
     
-    # 3. 初始前向传播 - 编码问题
     with torch.no_grad():
-        outputs = model.base_causallm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-            output_hidden_states=True,
+        outputs = model.forward(
+            input_ids,
+            torch.ones_like(input_ids, device=device),
+            labels,
+            position_ids,
         )
-        past_key_values = outputs.past_key_values
-        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [batch_size, hidden_dim]
     
-    logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+    inputs_embeds = outputs.inputs_embeds
     
-    # 4. 获取初始模式
-    mode, to_normal, to_soft, cur_entropy = controller.step(last_hidden, 0, logits)
+    # 4. 获取初始 hidden states 和 logits
+    with torch.no_grad():
+        base_outputs = model.base_causallm(inputs_embeds=inputs_embeds, output_hidden_states=True)
+    
+    hidden_states = base_outputs.hidden_states[-1][:, -1, :]  # [batch_size, hidden_dim]
+    logits = base_outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+    
+    # 5. 获取第一个 token
+    next_token = torch.argmax(logits, dim=-1)
+    next_token_id = next_token[0].item()
+    
+    # 6. 初始模式判断
+    mode, to_normal, to_soft, cur_entropy = controller.step(hidden_states, 0, logits)
     current_mode = "normal" if mode[0].item() == 1 else "soft"
     
-    if verbose:
-        print(f"[Init] Initial mode: {current_mode}, entropy: {cur_entropy[0].item():.4f}")
+    # 记录第一个 token
+    token_text = tokenizer.decode([next_token_id])
+    generated_tokens.append({
+        "token_id": next_token_id,
+        "token_text": token_text,
+        "mode": current_mode,
+        "entropy": cur_entropy[0].item(),
+    })
+    token_modes.append(current_mode)
+    token_entropies.append(cur_entropy[0].item())
+    generated_text_buffer += token_text
     
-    # 5. 如果初始就是 soft 模式，先插入 start_id (bot)
-    if current_mode == "soft":
-        with torch.no_grad():
-            out = model.base_causallm(
-                inputs_embeds=start_emb,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            past_key_values = out.past_key_values
-            last_hidden = out.hidden_states[-1][:, -1, :]
-        if verbose:
-            print(f"[Init] Starting in soft mode, inserted start_token (bot)")
+    # 7. 更新 inputs_embeds
+    new_token_embed = model.embedding(next_token).unsqueeze(1)  # [1, 1, hidden_dim]
+    new_inputs_embeds = torch.cat([inputs_embeds, new_token_embed], dim=1)
     
-    # 准备第一个 token 的 embedding
-    if greedy:
-        next_token_ids = torch.argmax(logits, dim=-1)
-    else:
-        probs = F.softmax(logits / 0.1, dim=-1)
-        next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    
-    next_input_embd = get_embedding(next_token_ids).unsqueeze(1)  # [1, 1, hidden_dim]
-    
-    finished = False
-    pred_tokens = []
-    
-    # 6. 生成循环
-    for step in range(max_new_tokens):
+    # 8. 生成循环
+    for step in range(1, max_new_tokens):
         start_time = time.perf_counter()
         
         # 检查是否达到连续 latent 上限
         if current_mode == "soft" and consecutive_latent_count >= max_latent_steps:
             current_mode = "normal"
             controller.state.mode[0] = 1
+            controller.state.mode_stay_steps[0] = 0  # ← 新增
+            controller.state.ref_entropy[0] = cur_entropy[0] 
             consecutive_latent_count = 0
             if verbose:
                 print(f"[Step {step}] Max latent steps ({max_latent_steps}) reached, forcing normal mode")
         
         # 前向传播
         with torch.no_grad():
-            if current_mode == "soft":
-                # Latent 模式: 使用 hidden states 作为输入
-                input_embd = last_hidden.unsqueeze(1)  # [1, 1, hidden_dim]
-            else:
-                # Normal 模式: 使用 token embedding
-                input_embd = next_input_embd
-            
-            out = model.base_causallm(
-                inputs_embeds=input_embd,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            past_key_values = out.past_key_values
-            last_hidden = out.hidden_states[-1][:, -1, :]
+            base_outputs = model.base_causallm(inputs_embeds=new_inputs_embeds, output_hidden_states=True)
         
         step_time = time.perf_counter() - start_time
-        logits = out.logits[:, -1, :]
+        
+        hidden_states = base_outputs.hidden_states[-1][:, -1, :]
+        logits = base_outputs.logits[:, -1, :]
         
         # 获取下一个 token
-        if greedy:
-            next_token_ids = torch.argmax(logits, dim=-1)
-        else:
-            probs = F.softmax(logits / 0.1, dim=-1)
-            next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        next_token = torch.argmax(logits, dim=-1)
+        next_token_id = next_token[0].item()
         
-        next_token_id = next_token_ids[0].item()
+        # 检查是否结束
+        end_token_mask = (next_token == tokenizer.eos_token_id)
+        
+        # 更新模式
+        mode, to_normal, to_soft, cur_entropy = controller.step(
+            hidden_states, step, logits, end_token_mask
+        )
         
         # 记录时间
         if current_mode == "normal":
@@ -1032,19 +846,31 @@ def coconut_adaptive_generate_with_timing(
         else:
             time_stats.add_soft(step_time)
         
-        # 检查是否结束
-        end_token_mask = (next_token_ids == eos_id)
+        # 记录切换事件
+        if to_normal[0].item():
+            switch_events.append((step, "soft->normal", cur_entropy[0].item()))
+        if to_soft[0].item():
+            switch_events.append((step, "normal->soft", cur_entropy[0].item()))
         
-        # 更新模式
-        mode, to_normal, to_soft, cur_entropy = controller.step(
-            last_hidden, step + 1, logits, end_token_mask
-        )
-        
-        # 记录当前步骤
         token_modes.append(current_mode)
         token_entropies.append(cur_entropy[0].item())
         
-        if current_mode == "normal":
+        # 根据当前模式决定下一步操作
+        is_soft = (mode[0].item() == 0) and (not controller.state.locked_normal[0].item())
+        
+        if current_mode == "soft" and is_soft and consecutive_latent_count < max_latent_steps:
+            # Latent 模式: 使用 hidden states 作为下一个输入
+            consecutive_latent_count += 1
+            new_token_embed = hidden_states.unsqueeze(1)  # [1, 1, hidden_dim]
+            
+            generated_tokens.append({
+                "token_id": -1,
+                "token_text": "<latent>",
+                "mode": current_mode,
+                "entropy": cur_entropy[0].item(),
+            })
+        else:
+            # Normal 模式: 使用 token embedding
             consecutive_latent_count = 0
             
             token_text = tokenizer.decode([next_token_id])
@@ -1061,89 +887,35 @@ def coconut_adaptive_generate_with_timing(
                             print(f"[Step {step}] Answer trigger '{trigger}' detected, locking normal mode")
                         break
             
-            pred_tokens.append(next_token_id)
-            
             generated_tokens.append({
                 "token_id": next_token_id,
                 "token_text": token_text,
                 "mode": current_mode,
                 "entropy": cur_entropy[0].item(),
-                "answer_locked": controller.state.answer_locked[0].item(),
             })
             
-            if next_token_id == eos_id:
-                finished = True
-        else:
-            # Latent 模式
-            consecutive_latent_count += 1
+            new_token_embed = model.embedding(next_token).unsqueeze(1)
             
-            generated_tokens.append({
-                "token_id": -1,
-                "token_text": "<latent>",
-                "mode": current_mode,
-                "entropy": cur_entropy[0].item(),
-                "answer_locked": controller.state.answer_locked[0].item(),
-            })
+            # 检查是否结束
+            if next_token_id == tokenizer.eos_token_id:
+                break
         
-        # 处理模式切换时的特殊 token (参考 CODI 逻辑)
-        if to_normal[0].item():
-            # soft -> normal: 插入 end_token (eot)，然后用下一个 token 的 embedding
-            switch_events.append((step, "soft->normal", cur_entropy[0].item()))
-            if verbose:
-                print(f"[Step {step}] soft->normal, inserting end_token (eot)")
-            
-            # 先插入 eot
-            with torch.no_grad():
-                out = model.base_causallm(
-                    inputs_embeds=end_emb,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                past_key_values = out.past_key_values
-                # 不更新 last_hidden，因为接下来要用 token embedding
-            
-            next_input_embd = get_embedding(next_token_ids).unsqueeze(1)
-            
-        elif to_soft[0].item():
-            # normal -> soft: 插入 start_token (bot)，然后用 hidden states
-            switch_events.append((step, "normal->soft", cur_entropy[0].item()))
-            if verbose:
-                print(f"[Step {step}] normal->soft, inserting start_token (bot)")
-            
-            # 先插入 bot 并更新 hidden states
-            with torch.no_grad():
-                out = model.base_causallm(
-                    inputs_embeds=start_emb,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                past_key_values = out.past_key_values
-                last_hidden = out.hidden_states[-1][:, -1, :]
-            # soft 模式下不需要设置 next_input_embd，因为会用 last_hidden
-            
-        else:
-            # 没有模式切换，正常更新 next_input_embd
-            next_input_embd = get_embedding(next_token_ids).unsqueeze(1)
+        # 更新 inputs_embeds
+        new_inputs_embeds = torch.cat([new_inputs_embeds, new_token_embed], dim=1)
         
         # 决定下一步模式
         if controller.state.answer_locked[0]:
-            next_mode = "normal"
+            current_mode = "normal"
         elif consecutive_latent_count >= max_latent_steps:
-            next_mode = "normal"
+            current_mode = "normal"
         else:
-            next_mode = "normal" if mode[0].item() == 1 else "soft"
-        
-        current_mode = next_mode
-        
-        if finished:
-            break
+            current_mode = "normal" if mode[0].item() == 1 else "soft"
     
-    # 7. 提取输出文本
-    output_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+    # 9. 提取输出文本 (只包含实际 token)
+    output_tokens = [t["token_id"] for t in generated_tokens if t["token_id"] != -1]
+    output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
     
-    # 8. 统计模式分布
+    # 10. 统计模式分布
     mode_counts = {"normal": 0, "soft": 0}
     for m in token_modes:
         mode_counts[m] += 1
@@ -1161,6 +933,7 @@ def coconut_adaptive_generate_with_timing(
     }
     
     return result, time_stats
+
 
 # ============================================================================
 # 数据集评估
@@ -1298,7 +1071,7 @@ def main():
     parser.add_argument("--base_model_path", type=str, default="./CODI/pretrained/Llama-3.2-1B-Instruct")
     parser.add_argument("--checkpoint_path", type=str, default=None,
                         help="Coconut checkpoint path (single file)")
-    parser.add_argument("--ckpt_dir", type=str, default="./CODI/pretrained/CODI-llama3.2-1b-Instruct",
+    parser.add_argument("--ckpt_dir", type=str, default="./CODI/pretrained/SIM_COT-LLaMA3-CODI-1B", # SIM_COT-LLaMA3-CODI-1B   CODI-llama3.2-1b-Instruct
                         help="CODI checkpoint directory")
     parser.add_argument("--predictor_path", type=str, default=None,
                         help="EntropyPredictor path")
@@ -1339,6 +1112,10 @@ def main():
     parser.add_argument("--random_prob", type=float, default=0.5,
                         help="随机模式下切换到 normal mode 的概率。设置 1.0 为全显, 0.0 为全隐。")
     
+    parser.add_argument("--step_start_ids", type=int, nargs='+', default=[2501, 1134],
+                        help="Step start token IDs (<<)")
+    parser.add_argument("--step_end_id", type=int, default=2511,
+                        help="Step end token ID (>>)")
 
     args = parser.parse_args()
     
@@ -1397,6 +1174,8 @@ def main():
             verbose=args.verbose,
             greedy=args.greedy,
             random_prob=args.random_prob,
+            step_start_ids=tuple(args.step_start_ids),  # 新增
+            step_end_id=args.step_end_id,  # 新增
         )
     
     # 加载数据集
