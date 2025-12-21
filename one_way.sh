@@ -5,7 +5,7 @@
 
 
 # ========== 配置变量 ==========
-EXPT_NAME="gsm8k_llama1b_cot"
+EXPT_NAME="gsm8k_llama1b_adaptive"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
 SAVE_DIR="${SAVE_DIR:-$BASE_DIR/CODI/ckpts}"
@@ -55,8 +55,9 @@ echo "Starting Training on GPU ${GPU}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-# CUDA_VISIBLE_DEVICES="0,1" torchrun --nproc_per_node=2 train_adaptivate.py \
-CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29501 train_adaptive.py \
+
+# CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29501 train_adaptive.py \
+CUDA_VISIBLE_DEVICES="${GPU}" python train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -74,7 +75,7 @@ CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29501 train
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --save_strategy "steps" \
-    --save_steps 10 \
+    --save_steps 100 \
     --save_total_limit 30 \
     --save_safetensors False \
     --weight_decay 0.1 \
@@ -94,11 +95,10 @@ CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29501 train
     --adaptive_training True\
     --window_e_to_l 5 \
     --window_l_to_e 0 \
-    --exp_mode True \
-    --exp_data_num 1000 \
     --baseline_mode random \
-    --random_prob 1 \
-    --ce_loss_factor 1 --ref_loss_factor 0 --explain_loss_factor 0 --align_loss_factor 0 --distill_loss_factor 0 \
+    --random_prob 0.5 \
+    --use_decoder \
+    --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 0.1 --align_loss_factor 20 --distill_loss_factor 20 \
     2>&1 | tee "$TRAIN_LOG"
 
     # --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
@@ -145,18 +145,17 @@ cd ${BASE_DIR}
 
 python step4_adaptive_step.py \
     --model_type codi \
-    --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+    --base_model_path ./CODI/pretrained/${MODEL_NAME} \
     --ckpt_dir "$CKPT_FOR_EVAL" \
-    --predictor_path checkpoints/entropy_predictor.pt \
     --data_name gsm8k \
     --bf16 \
-    --batch_size 8 \
-    --baseline_mode random \
-    --random_prob 1 \
+    --baseline_mode adaptive \
     --prj_dim 2048 \
     --max_switch_count 0 \
-    --window_e_to_l 256 \
+    --window_e_to_l 0 \
     --window_l_to_e 0 \
-    --max_latent 0 \
-    --max_samples 50
+    --max_latent 3
 
+
+    # --baseline_mode random \
+    # --random_prob 1 \

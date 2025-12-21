@@ -65,7 +65,7 @@ from peft import LoraConfig, TaskType
 from coconut import Coconut
 
 # 导入 CODI
-from model import CODI, ModelArguments, TrainingArguments
+from model_adaptive import CODI, ModelArguments, TrainingArguments
 
 from Swicontrol import EntropyPredictor, compute_entropy_swir, TimeStats, SwiRModeState, SwiRController, AdaptiveController
 
