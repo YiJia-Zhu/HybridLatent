@@ -70,7 +70,7 @@ echo "Starting Training on GPU ${GPUS[0]}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-CUDA_VISIBLE_DEVICES="4,5,6,7" torchrun --nproc_per_node=4 --master_port 29505 train_adaptive.py \
+CUDA_VISIBLE_DEVICES="5,7" torchrun --nproc_per_node=2 --master_port 29505 train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -109,7 +109,7 @@ CUDA_VISIBLE_DEVICES="4,5,6,7" torchrun --nproc_per_node=4 --master_port 29505 t
     --window_e_to_l 5 \
     --window_l_to_e 0 \
     --exp_mode True \
-    --exp_data_num 10000 \
+    --exp_data_num 100 \
     --baseline_mode random \
     --random_prob 0.5 \
     --use_decoder \
@@ -191,6 +191,7 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python step4_adaptive_eval.py \
     --max_switch_count 5 \
     --window_e_to_l 256 \
     --window_l_to_e 0 \
+    --max_samples 50 \
     2>&1 | tee "$TEST_COT_LOG" &
 PID1=$!
 PIDS+=($PID1)
@@ -210,6 +211,7 @@ CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_step.py \
     --window_e_to_l 0 \
     --window_l_to_e 0 \
     --max_latent_steps 3 \
+    --max_samples 50 \
     2>&1 | tee "$TEST_ADAPTIVE_LOG" &
 PID2=$!
 PIDS+=($PID2)

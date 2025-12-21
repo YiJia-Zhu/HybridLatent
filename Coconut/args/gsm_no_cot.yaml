@@ -1,0 +1,57 @@
+# No-CoT 模式配置
+project: coconut
+save_path: ./ckpts/
+name: gsm-no-cot
+
+only_eval: False
+
+# 关键设置
+coconut: False
+cot: False           # 改为 False
+no_thoughts: False
+no_cot: True         # 改为 True
+coconutgpt: True
+
+c_thought: 0
+epochs_per_stage: 1
+max_latent_stage: 0
+pad_latent_to_max: True
+
+save_only_improve: True
+uniform_prob: 0.0
+
+# model_id: ./pretrained/Llama-3.2-1B-Instruct # 注意coconutgpt
+model_id: ./pretrained/gpt2
+load_model_path: None  # 需要用 no-cot 训练的模型
+
+seed: 0
+resume: 0
+bf16: False
+
+train_path: ./data/gsm_train.json
+val_path: ./data/gsm_test.json
+
+reset_optimizer: False
+batch_size_training: 32
+debug: False
+gradient_accumulation_steps: 1
+num_epochs: 25
+lr: !!float "1e-4"
+weight_decay: 0.01
+
+mode: coconut_baseline
+training_method: only_base_causallm
+wandb: False
+
+
+```
+
+## 重要提示
+
+⚠️ **模型匹配问题**：
+- 如果你用 **CoT 数据训练**的模型，评估时用 **No-CoT 模式**，效果会很差
+- 每种模式需要用**对应模式训练**的 checkpoint
+```
+CoT 训练 → CoT 评估 ✓
+No-CoT 训练 → No-CoT 评估 ✓
+CoT 训练 → No-CoT 评估 ✗ (不匹配)

@@ -1,7 +1,11 @@
 assets
 checkpoints
-Coconut
+Coconut/*
 CODI/*
+!Coconut/*.py
+!Coconut/args
+!Coconut/*.sh
+!Coconut/*.py
 !CODI/src/
 !CODI/*.py
 !CODI/*.sh
