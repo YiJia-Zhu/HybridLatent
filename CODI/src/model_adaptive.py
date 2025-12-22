@@ -555,69 +555,74 @@ class CODI(torch.nn.Module):
         step_ratio: float = None,
         debug: bool = False,
     ):
-
-        # 在 forward 方法开头添加一个辅助函数:
+        """
+        修复版Forward：正确处理PAD和attention_mask
+        - 方案A：维护累积的attention_mask
+        - 方案B：动态去除trailing PAD
+        """
+        
+        # ============ 辅助函数：去除trailing PAD ============
+        def trim_trailing_pads(token_ids, pad_id):
+            """
+            去除batch内所有样本共同的trailing PAD
+            返回: trimmed_ids, valid_mask
+            """
+            batch_size, seq_len = token_ids.shape
+            
+            # 找到每个样本最后一个非PAD位置
+            is_not_pad = (token_ids != pad_id)
+            if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != pad_id:
+                is_not_pad = is_not_pad & (token_ids != self.tokenizer.pad_token_id)
+            
+            # 计算每个样本的有效长度
+            valid_lens = is_not_pad.long().sum(dim=1)  # [B]
+            
+            if valid_lens.max().item() == 0:
+                # 全是PAD，返回单个PAD
+                return token_ids[:, :1], torch.zeros(batch_size, 1, dtype=torch.bool, device=token_ids.device)
+            
+            # 裁剪到batch内最大有效长度
+            max_valid_len = valid_lens.max().item()
+            trimmed_ids = token_ids[:, :max_valid_len]
+            
+            # 创建mask：[B, max_valid_len]
+            valid_mask = is_not_pad[:, :max_valid_len]
+            
+            return trimmed_ids, valid_mask
+        
         def get_mode_decision(swir_state, cur_entropy, step_idx):
-            """根据 baseline_mode 决定模式"""
+            """根据baseline_mode决定模式"""
             if self.baseline_mode == "random":
-                # random 模式：随机决定模式
                 random_val = torch.rand(batch_size, device=device)
                 if step_idx == 0:
-                    # 初始化时随机选择模式
                     swir_state.mode = (random_val < self.random_prob).long()
                 else:
-                    # 随机切换
                     to_normal = (random_val < self.random_prob) & (swir_state.mode == 0)
                     to_soft = (random_val >= self.random_prob) & (swir_state.mode == 1)
                     swir_state.mode = torch.where(to_normal, torch.ones_like(swir_state.mode), swir_state.mode)
                     swir_state.mode = torch.where(to_soft, torch.zeros_like(swir_state.mode), swir_state.mode)
                 return swir_state, torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.bool, device=device)
             else:
-                # adaptive 模式：使用原有的熵判断
                 return self.swir_controller.update(swir_state, cur_entropy, step=step_idx)
-
-
+        
+        # ============ 初始化 ============
         if not self.fix_attn_mask:
             ref_attention_mask = None
         
         batch_size = encoder_input_ids.shape[0]
         device = encoder_input_ids.device
         
-        # 确定pad_id
         if 'llama' in self.model_name.lower() or 'qwen' in self.model_name.lower():
             model_pad_id = self.pad_token_id
         else:
             model_pad_id = self.tokenizer.pad_token_id
         
-        # ========== DEBUG: 打印输入信息 ==========
         if debug:
             print("=" * 100)
-            print("[DEBUG] " + "=" * 40 + " FORWARD START " + "=" * 40)
+            print("[DEBUG] FORWARD START - With Cumulative Attention Mask")
             print("=" * 100)
-            print(f"\n[DEBUG] >>> BASIC INFO <<<")
-            print(f"  batch_size={batch_size}, device={device}")
-            print(f"  model_pad_id={model_pad_id}, bot_id={self.bot_id}, eot_id={self.eot_id}")
-            print(f"  encoder_input_ids shape: {encoder_input_ids.shape}")
-            print(f"  decoder_input_ids shape: {decoder_input_ids.shape}")
-            print(f"  ref_input_ids shape: {ref_input_ids.shape}")
-            print(f"  labels shape: {labels.shape}")
-            
-            print(f"\n[DEBUG] >>> ENCODER INPUT (Question) <<<")
-            for b in range(min(batch_size, 2)):
-                enc_text = self.tokenizer.decode(encoder_input_ids[b], skip_special_tokens=False)
-                print(f"  Sample {b}: {enc_text[:300]}...")
-            
-            print(f"\n[DEBUG] >>> REF INPUT (Q + full CoT + A) <<<")
-            for b in range(min(batch_size, 2)):
-                ref_text = self.tokenizer.decode(ref_input_ids[b], skip_special_tokens=False)
-                print(f"  Sample {b}: {ref_text[:500]}...")
-                print(f"  Last token: {ref_input_ids[b][-1].item()}, EOT={self.eot_id}, EOS={self.tokenizer.eos_token_id}")
-                
         
-        # ========== 2. 解析步骤 ==========
-        if debug:
-            print(f"\n[DEBUG] >>> PARSING STEPS <<<")
-            
+        # ============ 解析步骤 ============
         if 'llama' in self.model_name.lower() or 'qwen' in self.model_name.lower():
             steps_list = get_steps(ref_input_ids, self.num_latent + 1)
             steps_pad_list = pad_steps(steps_list, pad_id=model_pad_id)
@@ -634,18 +639,6 @@ class CODI(torch.nn.Module):
         
         num_steps = len(steps_pad_list[0]) if steps_pad_list else self.num_latent
         
-        # ========== [修改点1] 打印原始steps数量 vs 处理后数量 ==========
-        if debug:
-            print(f"\n[DEBUG] >>> STEP COUNT CHECK <<<")
-            print(f"  num_latent (config): {self.num_latent}")
-            print(f"  num_steps (after processing): {num_steps}")
-            for b in range(min(batch_size, 2)):
-                original_count = len([s for s in steps_list[b] if s != [model_pad_id]])
-                print(f"  Sample {b}: original steps parsed = {original_count}, final = {len(steps_pad_list[b])}")
-                if original_count > self.num_latent + 1:
-                    print(f"    ⚠️  MERGED: Steps exceeded num_latent+1, last steps were merged!")
-        
-        # 找到每个step的位置
         if 'llama' in self.model_name.lower() or 'qwen' in self.model_name.lower():
             step_positions = self.find_step_positions_in_ref(
                 ref_input_ids, start_ids=(2501, 1134), pad_id=model_pad_id
@@ -659,52 +652,7 @@ class CODI(torch.nn.Module):
             pad_cols = num_steps - step_positions.size(1)
             step_positions = F.pad(step_positions, (0, pad_cols), value=-1)
         
-        # ========== DEBUG: 打印解析出的步骤 ==========
-        if debug:
-            print(f"  num_steps={num_steps}")
-            print(f"  step_positions shape: {step_positions.shape}")
-            print(f"  step_positions: {step_positions.tolist()}")
-            
-            print(f"\n[DEBUG] >>> VERIFY STEP POSITIONS <<<")
-            for b in range(min(batch_size, 2)):
-                print(f"  Sample {b}:")
-                for s_i in range(min(num_steps, step_positions.size(1))):
-                    pos = step_positions[b, s_i].item()
-                    if pos >= 0 and pos < ref_input_ids.size(1):
-                        start = max(0, pos - 2)
-                        end = min(ref_input_ids.size(1), pos + 8)
-                        context_ids = ref_input_ids[b, start:end].tolist()
-                        context_decoded = self.tokenizer.decode(context_ids, skip_special_tokens=False)
-                        token_at_pos = ref_input_ids[b, pos].item()
-                        token_decoded = self.tokenizer.decode([token_at_pos])
-                        print(f"    Step {s_i}: pos={pos}, token_id={token_at_pos}, token='{token_decoded}'")
-                        print(f"      Context [...{start}:{end}...]: {context_decoded}")
-                    else:
-                        print(f"    Step {s_i}: pos={pos} (INVALID)")
-
-            print(f"\n[DEBUG] >>> PARSED STEPS CONTENT <<<")
-            for b in range(min(batch_size, 2)):
-                print(f"\n  Sample {b}:")
-                for s_i in range(num_steps):
-                    tokens = steps_pad_list[b][s_i]
-                    valid_tokens = [t for t in tokens if t != model_pad_id]
-                    if valid_tokens:
-                        decoded = self.tokenizer.decode(valid_tokens, skip_special_tokens=False)
-                    else:
-                        decoded = "[EMPTY/PAD ONLY]"
-                    
-                    num_eot = tokens.count(self.eot_id)
-                    num_bot = tokens.count(self.bot_id)
-                    num_pad = tokens.count(model_pad_id)
-                    
-                    print(f"    Step {s_i}: len={len(tokens)}, valid={len(valid_tokens)}, "
-                        f"eot={num_eot}, bot={num_bot}, pad={num_pad}")
-                    print(f"      Raw IDs (first 20): {tokens[:20]}{'...' if len(tokens) > 20 else ''}")
-                    print(f"      Decoded: {decoded[:120]}{'...' if len(decoded) > 120 else ''}")
-
-        # ========== 3. Encode问题 ==========
-        if debug:
-            print(f"\n[DEBUG] >>> ENCODER FORWARD <<<")
+        # ============ Encode问题 + 初始化累积mask ============
         past_key_values = None
         outputs = self.codi(
             input_ids=encoder_input_ids,
@@ -716,100 +664,76 @@ class CODI(torch.nn.Module):
         last_hidden = outputs.hidden_states[-1][:, -1, :]
         current_logits = outputs.logits[:, -1, :]
         
-        if debug:
-            print(f"  past_key_values: {len(past_key_values)} layers")
-            print(f"  Each KV shape: K={past_key_values[0][0].shape}, V={past_key_values[0][1].shape}")
-            print(f"  last_hidden shape: {last_hidden.shape}")
-            print(f"  current_logits shape: {current_logits.shape}")
-            
-            top_probs, top_ids = torch.softmax(current_logits, dim=-1).topk(5, dim=-1)
-            for b in range(min(batch_size, 2)):
-                top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
-                print(f"  Sample {b} top5 after encoder: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
+        # ★ 初始化累积attention_mask
+        if encoder_attention_mask is not None:
+            cumulative_attention_mask = encoder_attention_mask.clone()  # [B, Q_len]
+        else:
+            cumulative_attention_mask = torch.ones(
+                batch_size, encoder_input_ids.size(1), 
+                dtype=torch.long, device=device
+            )
         
-        # ========== 1. 教师模型输出 ==========
         if debug:
-            print(f"\n[DEBUG] >>> TEACHER MODEL FORWARD <<<")
-            
+            print(f"\n[DEBUG] Initial cumulative_attention_mask shape: {cumulative_attention_mask.shape}")
+        
+        # ============ 教师模型输出 ============
         with torch.no_grad():
             ref_outputs = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
         ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
         
-        if debug:
-            print(f"  ref_outputs.logits shape: {ref_outputs.logits.shape}")
-            print(f"  ref_outputs.hidden_states: {len(ref_outputs.hidden_states)} layers")
-            print(f"  Each hidden state shape: {ref_outputs.hidden_states[0].shape}")
-
-        # ========== 4. 初始化SwiR状态 ==========
-        if debug:
-            print(f"\n[DEBUG] >>> SWIR INIT <<<")
-            
+        # ============ 初始化SwiR状态 ============
         swir_state = SwiRModeState.init(batch_size, device)
         cur_entropy = compute_entropy_swir(current_logits)
         swir_state, _, _ = self.swir_controller.update(swir_state, cur_entropy, step=0)
         
-        # ===== 新增：random 模式下随机初始化第一个 step =====
         if self.baseline_mode == "random":
             random_init = torch.rand(batch_size, device=device)
             swir_state.mode = (random_init < self.random_prob).long()
-
-        if debug:
-            print(f"  Initial entropy: {cur_entropy.tolist()}")
-            print(f"  Initial mode: {swir_state.mode.tolist()} (0=Latent, 1=Explicit)")
-            print(f"  SwiR thresholds - e_to_l: {self.swir_controller.window_e_to_l}, l_to_e: {self.swir_controller.window_l_to_e}")
         
         latent_embd = last_hidden.unsqueeze(1)
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
-            
-        if debug:
-            print(f"  Initial latent_embd shape: {latent_embd.shape}")
-            print(f"  Initial latent_embd norm: {latent_embd.norm(dim=-1).mean().item():.4f}")
         
-        # ========== 5. Loss累积 ==========
+        # ============ Loss初始化 ============
         _zero = self._zero_loss()
         ce_loss_total = _zero.clone()
         distill_loss_total = _zero.clone()
         explain_loss_total = _zero.clone()
         align_loss_total = _zero.clone()
-
+        
         mode_history = []
         entropy_history = []
         effective_ce_steps = 0
         effective_explain_steps = 0
-        ce_token_count = 0  # 总token数
-        
-        # ========== 用于追踪alignment loss计算 ==========
-        alignment_computed_at_steps = []  # 记录在哪些step计算了alignment loss
-        
-        # ===== 追踪上一步是否是Latent =====
+        ce_token_count = 0
+        alignment_computed_at_steps = []
         prev_was_latent = False
-        # ========== 6. 逐Step推理 ==========
+        
+        # ============ 逐Step推理 ============
         if debug:
             print("\n" + "=" * 100)
-            print("[DEBUG] " + "=" * 35 + " STEP-BY-STEP PROCESSING " + "=" * 35)
+            print("[DEBUG] STEP-BY-STEP PROCESSING WITH ATTENTION MASK")
             print("=" * 100)
         
         for step_i in range(num_steps):
-
-
             current_mode = swir_state.mode[0].item()
             is_latent_mode = (current_mode == 0)
             mode_str = 'L' if is_latent_mode else 'S'
             mode_history.append(mode_str)
             
             if debug:
-                print("\n" + "-" * 80)
-                print(f"[DEBUG] STEP {step_i}/{num_steps-1} | MODE: {'LATENT (L)' if is_latent_mode else 'EXPLICIT (S)'}")
-                print("-" * 80)
+                print(f"\n{'='*80}")
+                print(f"[STEP {step_i}] MODE: {'LATENT' if is_latent_mode else 'EXPLICIT'}")
+                print(f"{'='*80}")
             
-            # ===== 收集当前step所有batch的tokens =====
+            # ===== 收集当前step tokens =====
             current_step_list = []
             for b in range(batch_size):
                 current_step_list.append(steps_pad_list[b][step_i])
             current_step_list = dedup_trailing_pads(current_step_list, pad_id=model_pad_id)
             current_step_ids = torch.tensor(current_step_list, dtype=torch.long, device=device)
             
+            # 收集下一step（用于alignment/explain）
             next_step_ids = None
             if step_i + 1 < num_steps:
                 next_step_list = []
@@ -818,125 +742,81 @@ class CODI(torch.nn.Module):
                 next_step_list = dedup_trailing_pads(next_step_list, pad_id=model_pad_id)
                 next_step_ids = torch.tensor(next_step_list, dtype=torch.long, device=device)
             
-            if debug:
-                print(f"\n[DEBUG] Current Step Tokens:")
-                print(f"  current_step_ids shape: {current_step_ids.shape}")
-                for b in range(min(batch_size, 2)):
-                    step_tokens = current_step_ids[b].tolist()
-                    valid_tokens = [t for t in step_tokens if t != model_pad_id]
-                    decoded = self.tokenizer.decode(valid_tokens, skip_special_tokens=False) if valid_tokens else "[EMPTY]"
-                    print(f"  Sample {b} tokens (first 15): {step_tokens[:15]}...")
-                    print(f"  Sample {b} decoded: {decoded[:100]}...")
-                
-                if next_step_ids is not None:
-                    print(f"\n[DEBUG] Next Step Tokens (for alignment/explain):")
-                    print(f"  next_step_ids shape: {next_step_ids.shape}")
-                    for b in range(min(batch_size, 2)):
-                        next_tokens = next_step_ids[b].tolist()
-                        valid_next = [t for t in next_tokens if t != model_pad_id]
-                        next_decoded = self.tokenizer.decode(valid_next, skip_special_tokens=False) if valid_next else "[EMPTY]"
-                        print(f"  Sample {b} tokens (first 15): {next_tokens[:15]}...")
-                        print(f"  Sample {b} decoded: {next_decoded[:100]}...")
+            # ============================================================
+            # ★★★ Trim trailing PAD ★★★
+            # ============================================================
+            current_step_ids_trimmed, current_step_mask = trim_trailing_pads(current_step_ids, model_pad_id)
             
-                
+            if debug:
+                print(f"\n[PAD TRIMMING]")
+                print(f"  Original shape: {current_step_ids.shape}")
+                print(f"  Trimmed shape:  {current_step_ids_trimmed.shape}")
+                print(f"  Mask shape:     {current_step_mask.shape}")
+                print(f"  Sample 0 mask:  {current_step_mask[0].tolist()}")
+            
+            # ============================================================
+            
             if not is_latent_mode:
                 # ===== 显式模式 (S) =====
                 if debug:
-                    print(f"\n[DEBUG] >>> EXPLICIT MODE PROCESSING <<<")
+                    print(f"\n[EXPLICIT MODE]")
                 
-                step_len = current_step_ids.size(1)
+                step_len = current_step_ids_trimmed.size(1)
                 
-
-                # 处理当前句子和下一个步骤第一个token的loss，只有当上一步不是latent时才需要（latent→显式已在latent_exit_ce_loss处理）
+                # ===== 处理step入口的CE loss =====
                 if step_len >= 1 and not prev_was_latent:
-                    first_token = current_step_ids[:, 0].clone()
-                    # 过滤特殊token和pad
+                    first_token = current_step_ids_trimmed[:, 0].clone()
                     first_token[first_token == model_pad_id] = -100
                     if self.tokenizer.pad_token_id is not None:
                         first_token[first_token == self.tokenizer.pad_token_id] = -100
                     first_token[first_token == self.eot_id] = -100
                     first_token[first_token == self.bot_id] = -100
                     
-                    # if (first_token != -100).any():
-                    #     explicit_entry_ce_loss = self.loss_fct(current_logits, first_token)
-                    #     ce_loss_total = ce_loss_total + explicit_entry_ce_loss
                     if (first_token != -100).any():
                         valid_entry = (first_token != -100).sum().item()
                         explicit_entry_ce_loss = self.loss_fct_sum(current_logits, first_token)
                         ce_loss_total = ce_loss_total + explicit_entry_ce_loss
                         ce_token_count += valid_entry
-
+                        
                         if debug:
-                            target_decoded = self.tokenizer.decode([first_token[0].item()]) if first_token[0] != -100 else "[masked]"
-                            print(f"  ★ Explicit Entry CE Loss: {explicit_entry_ce_loss.item():.6f}, target='{target_decoded}'")
-
-
+                            print(f"  Explicit Entry CE: {explicit_entry_ce_loss.item():.6f}")
+                
+                # ===== Forward step tokens =====
                 if step_len > 1:
-                    step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
+                    step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids_trimmed)
+                    
+                    # ★★★ 方案A：更新累积mask ★★★
+                    cumulative_attention_mask = torch.cat([
+                        cumulative_attention_mask, 
+                        current_step_mask
+                    ], dim=1)
                     
                     if debug:
-                        print(f"  step_embds shape: {step_embds.shape}")
+                        print(f"\n[CUMULATIVE MASK UPDATE]")
+                        print(f"  New cumulative_mask shape: {cumulative_attention_mask.shape}")
+                        print(f"  Sample 0 mask (last 20): {cumulative_attention_mask[0, -20:].tolist()}")
                     
-                    step_attn_mask = (current_step_ids != model_pad_id)
-                    if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != model_pad_id:
-                        step_attn_mask = step_attn_mask & (current_step_ids != self.tokenizer.pad_token_id)
-                    step_attn_mask = step_attn_mask & (current_step_ids != self.eot_id) & (current_step_ids != self.bot_id)
-                    
-                    if debug:
-                        print(f"  step_attn_mask (sample 0, first 20): {step_attn_mask[0].tolist()[:20]}...")
-                        valid_count = step_attn_mask.sum(dim=1).tolist()
-                        print(f"  valid tokens per sample: {valid_count}")
-                    
+                    # Forward with attention_mask
                     with autocast(device_type='cuda',dtype=torch.bfloat16):
                         step_out = self.codi(
                             inputs_embeds=step_embds,
                             use_cache=True,
                             output_hidden_states=True,
                             past_key_values=past_key_values,
-                            attention_mask=None
+                            attention_mask=cumulative_attention_mask  # ★ 传入完整mask
                         )
                     past_key_values = step_out.past_key_values
                     
-                    if debug:
-                        print(f"\n[DEBUG] >>> CE LOSS CALCULATION <<<")
-                        
+                    # ===== CE Loss =====
                     step_logits = step_out.logits[:, :-1, :]
-                    step_targets = current_step_ids[:, 1:]
+                    step_targets = current_step_ids_trimmed[:, 1:]
                     
                     step_labels = step_targets.clone()
-                    step_labels[~step_attn_mask[:, 1:]] = -100
+                    step_labels[~current_step_mask[:, 1:]] = -100
                     step_labels[step_targets == model_pad_id] = -100
                     if self.tokenizer.pad_token_id is not None:
                         step_labels[step_targets == self.tokenizer.pad_token_id] = -100
                     
-                    if debug:
-                        print(f"  step_logits shape: {step_logits.shape} [batch, seq-1, vocab]")
-                        print(f"  step_targets shape: {step_targets.shape} [batch, seq-1]")
-                        print(f"  step_labels (sample 0, first 15): {step_labels[0, :15].tolist()}")
-                        valid_labels = (step_labels != -100).sum().item()
-                        print(f"  total valid labels for CE: {valid_labels}")
-                        
-                        if valid_labels > 0:
-                            pred_ids = step_logits.argmax(dim=-1)
-                            for b in range(min(batch_size, 1)):
-                                mask_b = step_labels[b] != -100
-                                if mask_b.any():
-                                    pred_tokens = pred_ids[b][mask_b][:5]
-                                    true_tokens = step_labels[b][mask_b][:5]
-                                    pred_decoded = [self.tokenizer.decode([t]) for t in pred_tokens.tolist()]
-                                    true_decoded = [self.tokenizer.decode([t]) for t in true_tokens.tolist()]
-                                    print(f"  Sample {b} pred vs true (first 5):")
-                                    print(f"    Pred: {pred_decoded}")
-                                    print(f"    True: {true_decoded}")
-                    
-                    # if (step_labels != -100).sum() > 0:
-                    #     ce_loss = self.loss_fct(
-                    #         step_logits.reshape(-1, step_logits.size(-1)),
-                    #         step_labels.reshape(-1)
-                    #     )
-                    #     ce_loss_total = ce_loss_total + ce_loss
-                    #     effective_ce_steps += 1
-                                    
                     if (step_labels != -100).sum() > 0:
                         valid_step_tokens = (step_labels != -100).sum().item()
                         ce_loss = self.loss_fct_sum(
@@ -948,106 +828,87 @@ class CODI(torch.nn.Module):
                         effective_ce_steps += 1
                         
                         if debug:
-                            print(f"\n  *** CE Loss = CrossEntropyLoss(logits[{step_logits.shape}], labels[{step_labels.shape}])")
-                            print(f"  *** CE Loss value: {ce_loss.item():.6f} ***")
-                    else:
-                        if debug:
-                            print(f"\n  *** No valid labels, skipping CE loss ***")
+                            print(f"  Step CE Loss: {ce_loss.item():.6f} (valid_tokens={valid_step_tokens})")
                     
                     last_hidden = step_out.hidden_states[-1][:, -1, :]
                     current_logits = step_out.logits[:, -1, :]
                     latent_embd = last_hidden.unsqueeze(1)
                     if self.use_prj:
                         latent_embd = self.prj(latent_embd)
+                
+                elif step_len == 1:
+                    # 单token step
+                    step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids_trimmed)
                     
-                    if debug:
-                        print(f"\n[DEBUG] After explicit step:")
-                        print(f"  last_hidden shape: {last_hidden.shape}")
-                        print(f"  latent_embd shape: {latent_embd.shape}")
-                        top_probs, top_ids = torch.softmax(current_logits, dim=-1).topk(5, dim=-1)
-                        for b in range(min(batch_size, 1)):
-                            top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
-                            print(f"  Sample {b} top5 next: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
+                    # ★ 更新累积mask
+                    cumulative_attention_mask = torch.cat([
+                        cumulative_attention_mask, 
+                        current_step_mask
+                    ], dim=1)
+                    
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
+                        step_out = self.codi(
+                            inputs_embeds=step_embds,
+                            use_cache=True,
+                            output_hidden_states=True,
+                            past_key_values=past_key_values,
+                            attention_mask=cumulative_attention_mask  # ★
+                        )
+                    past_key_values = step_out.past_key_values
+                    last_hidden = step_out.hidden_states[-1][:, -1, :]
+                    current_logits = step_out.logits[:, -1, :]
+                    latent_embd = last_hidden.unsqueeze(1)
+                    if self.use_prj:
+                        latent_embd = self.prj(latent_embd)
                 
-                # elif step_len == 1:
-                #     if debug:
-                #         print(f"  Single token step, just forwarding")
-                #     step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
-                #     with autocast(device_type='cuda',dtype=torch.bfloat16):
-                #         step_out = self.codi(
-                #             inputs_embeds=step_embds,
-                #             use_cache=True,
-                #             output_hidden_states=True,
-                #             past_key_values=past_key_values
-                #         )
-                #     past_key_values = step_out.past_key_values
-                #     last_hidden = step_out.hidden_states[-1][:, -1, :]
-                #     current_logits = step_out.logits[:, -1, :]
-                #     latent_embd = last_hidden.unsqueeze(1)
-                #     if self.use_prj:
-                #         latent_embd = self.prj(latent_embd)
-                
-                # ========== 显式模式结束：更新熵和模式 ==========
+                # 更新熵和模式
                 cur_entropy = compute_entropy_swir(current_logits)
                 entropy_history.append(cur_entropy.mean().item())
-                old_mode = swir_state.mode.clone()
                 swir_state, _, _ = get_mode_decision(swir_state, cur_entropy, step_i + 1)
-                
                 prev_was_latent = False
-
-                if debug:
-                    print(f"\n[DEBUG] === END OF EXPLICIT STEP {step_i} ===")
-                    print(f"  Entropy: {cur_entropy.tolist()}")
-                    print(f"  Mode changed: {old_mode.tolist()} -> {swir_state.mode.tolist()}")
             
             else:
                 # ===== 隐式模式 (L) =====
                 if debug:
-                    print(f"\n[DEBUG] >>> LATENT MODE PROCESSING <<<")
-                    print(f"  prev_was_latent: {prev_was_latent}")
-                    print(f"  Pipeline: [BOT if first L] → LATENT → [EOT if last L]")
+                    print(f"\n[LATENT MODE]")
                 
-                # ===== 1. 只在Latent序列开始时输入<bot> =====
+                # ===== 1. BOT token (只在第一个L时) =====
                 if not prev_was_latent:
                     bot_ids = torch.full((batch_size, 1), self.bot_id, dtype=torch.long, device=device)
                     bot_embd = self.get_embd(self.codi, self.model_name)(bot_ids)
                     
+                    # ★ BOT是有效token，mask=1
+                    bot_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+                    cumulative_attention_mask = torch.cat([cumulative_attention_mask, bot_mask], dim=1)
+                    
                     if debug:
-                        print(f"\n[DEBUG] Step 1: BOT Token (first L in sequence)")
-                        print(f"  BOT token ID: {self.bot_id}")
-                        print(f"  bot_embd shape: {bot_embd.shape}")
+                        print(f"  BOT added, new mask shape: {cumulative_attention_mask.shape}")
                     
                     with autocast(device_type='cuda',dtype=torch.bfloat16):
                         bot_out = self.codi(
                             inputs_embeds=bot_embd,
                             use_cache=True,
                             output_hidden_states=True,
-                            past_key_values=past_key_values
+                            past_key_values=past_key_values,
+                            attention_mask=cumulative_attention_mask  # ★
                         )
                     past_key_values = bot_out.past_key_values
-                    
-                    if debug:
-                        bot_logits = bot_out.logits[:, -1, :]
-                        top_probs, top_ids = torch.softmax(bot_logits, dim=-1).topk(5, dim=-1)
-                        for b in range(min(batch_size, 1)):
-                            top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
-                            print(f"  After BOT, Sample {b} top5: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
-                else:
-                    if debug:
-                        print(f"\n[DEBUG] Skipping BOT (continuing Latent sequence)")
                 
-                # ===== 2. 输入latent embedding =====
+                # ===== 2. Latent embedding =====
+                # ★ Latent也是有效位置，mask=1
+                latent_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+                cumulative_attention_mask = torch.cat([cumulative_attention_mask, latent_mask], dim=1)
+                
                 if debug:
-                    print(f"\n[DEBUG] Step 2: LATENT Embedding")
-                    print(f"  latent_embd shape: {latent_embd.shape}")
-                    print(f"  latent_embd norm: {latent_embd.norm(dim=-1).mean().item():.4f}")
+                    print(f"  LATENT added, new mask shape: {cumulative_attention_mask.shape}")
                 
                 with autocast(device_type='cuda',dtype=torch.bfloat16):
                     latent_out = self.codi(
                         inputs_embeds=latent_embd,
                         use_cache=True,
                         output_hidden_states=True,
-                        past_key_values=past_key_values
+                        past_key_values=past_key_values,
+                        attention_mask=cumulative_attention_mask  # ★
                     )
                 past_key_values = latent_out.past_key_values
                 last_hidden = latent_out.hidden_states[-1][:, -1, :]
@@ -1055,39 +916,15 @@ class CODI(torch.nn.Module):
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
                 
-                if debug:
-                    latent_logits = latent_out.logits[:, -1, :]
-                    top_probs, top_ids = torch.softmax(latent_logits, dim=-1).topk(5, dim=-1)
-                    for b in range(min(batch_size, 1)):
-                        top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
-                        print(f"  After LATENT, Sample {b} top5: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
-                    print(f"  Updated latent_embd shape: {latent_embd.shape}")
-
-
-                # ===== 5. Explain Loss (改为对齐当前step) =====
-                if debug:
-                    print(f"\n[DEBUG] >>> EXPLAIN LOSS CALCULATION <<<")
-                    
+                # ===== 3. Explain Loss =====
                 if self.model_args.use_decoder:
-                    # 改动1: 使用 current_step_ids 而不是 next_step_ids
-                    current_step_len = current_step_ids.size(1)
+                    current_step_len = current_step_ids_trimmed.size(1)
                     if current_step_len > 0:
-                        if debug:
-                            print(f"\n  Input preparation:")
-                            print(f"    current_step_ids shape: {current_step_ids.shape}")
-                        
-                        # 改动2: 用当前step的embedding
-                        current_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
-                        
-                        # 改动3: decoder输入为 [latent, current_step]，不需要eot分隔符
+                        current_embds = self.get_embd(self.codi, self.model_name)(current_step_ids_trimmed)
                         decoder_input = torch.cat([latent_embd, current_embds], dim=1)
                         
-                        if debug:
-                            print(f"    decoder_input shape: {decoder_input.shape} = [LATENT(1) + current({current_step_len})]")
-                        
-                        # 改动4: prefix只有1个位置（latent），不是2个
-                        prefix_placeholder = torch.full((batch_size, 1), -570, dtype=current_step_ids.dtype, device=device)
-                        indices_with_prefix = torch.cat([prefix_placeholder, current_step_ids], dim=1)
+                        prefix_placeholder = torch.full((batch_size, 1), -570, dtype=current_step_ids_trimmed.dtype, device=device)
+                        indices_with_prefix = torch.cat([prefix_placeholder, current_step_ids_trimmed], dim=1)
                         
                         explain_labels = indices_with_prefix.clone()
                         explain_labels = explain_labels.masked_fill(
@@ -1128,104 +965,68 @@ class CODI(torch.nn.Module):
                                 effective_explain_steps += 1
                                 
                                 if debug:
-                                    print(f"  *** Explain Loss value: {explain_loss.item():.6f} ***")
+                                    print(f"  Explain Loss: {explain_loss.item():.6f}")
                 
-                # ===== 3. 基于latent输出计算熵，更新模式 =====
-                if debug:
-                    print(f"\n[DEBUG] >>> CHECK MODE TRANSITION (based on latent output) <<<")
-                
-                current_logits = latent_out.logits[:, -1, :]  # 基于latent输出计算熵
+                # ===== 4. 判断是否是最后一个L =====
+                current_logits = latent_out.logits[:, -1, :]
                 cur_entropy = compute_entropy_swir(current_logits)
                 entropy_history.append(cur_entropy.mean().item())
                 old_mode = swir_state.mode.clone()
                 swir_state, _, _ = get_mode_decision(swir_state, cur_entropy, step_i + 1)
                 new_mode = swir_state.mode[0].item()
                 
-                # 判断是否是Latent序列的最后一个
                 is_last_latent = (new_mode == 1) or (step_i == num_steps - 1)
                 
-                if debug:
-                    print(f"  Current entropy: {cur_entropy.tolist()}")
-                    print(f"  Old mode: {old_mode.tolist()} (0=L, 1=S)")
-                    print(f"  New mode: {swir_state.mode.tolist()} (0=L, 1=S)")
-                    print(f"  step_i = {step_i}, num_steps = {num_steps}")
-                    print(f"  ★ IS_LAST_LATENT = {is_last_latent}")
-                
-                # ===== 4. 只在Latent序列结束时输入<eot> =====
-                eot_out = None  # 初始化，用于后续alignment loss
+                # ===== 5. EOT token (只在最后一个L时) =====
                 if is_last_latent:
                     eot_ids = torch.full((batch_size, 1), self.eot_id, dtype=torch.long, device=device)
                     eot_embd = self.get_embd(self.codi, self.model_name)(eot_ids)
                     
+                    # ★ EOT是有效token，mask=1
+                    eot_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+                    cumulative_attention_mask = torch.cat([cumulative_attention_mask, eot_mask], dim=1)
+                    
                     if debug:
-                        print(f"\n[DEBUG] Step 3: EOT Token (last L in sequence)")
-                        print(f"  EOT token ID: {self.eot_id}")
-                        print(f"  eot_embd shape: {eot_embd.shape}")
+                        print(f"  EOT added, new mask shape: {cumulative_attention_mask.shape}")
                     
                     with autocast(device_type='cuda',dtype=torch.bfloat16):
                         eot_out = self.codi(
                             inputs_embeds=eot_embd,
                             use_cache=True,
                             output_hidden_states=True,
-                            past_key_values=past_key_values
+                            past_key_values=past_key_values,
+                            attention_mask=cumulative_attention_mask  # ★
                         )
                     past_key_values = eot_out.past_key_values
-                    current_logits = eot_out.logits[:, -1, :]  # 更新logits
-
-
-
-                    if debug:
-                        top_probs, top_ids = torch.softmax(current_logits, dim=-1).topk(5, dim=-1)
-                        for b in range(min(batch_size, 1)):
-                            top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
-                            print(f"  After EOT, Sample {b} top5: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
+                    current_logits = eot_out.logits[:, -1, :]
                     
-                    
-                    # ==== latent_exit_ce_loss补丁，eot后面需要学会预测"<<"
+                    # Latent退出CE loss
                     eot_logits = eot_out.logits[:, -1, :]
-                    
                     if next_step_ids is not None:
-                        # 有下一步：预测 
                         target_token = next_step_ids[:, 0].clone()
                     else:
-                        # 最后一步：预测 decoder_input_ids 的第一个 token（比如 "The"）
                         target_token = decoder_input_ids[:, 0].clone()
                     
-                    # 过滤 pad
                     target_token[target_token == model_pad_id] = -100
                     if self.tokenizer.pad_token_id is not None:
                         target_token[target_token == self.tokenizer.pad_token_id] = -100
                     
-                    # if (target_token != -100).any():
-                    #     latent_exit_ce_loss = self.loss_fct(eot_logits, target_token)
-                    #     ce_loss_total = ce_loss_total + latent_exit_ce_loss
                     if (target_token != -100).any():
                         valid_exit = (target_token != -100).sum().item()
                         latent_exit_ce_loss = self.loss_fct_sum(eot_logits, target_token)
                         ce_loss_total = ce_loss_total + latent_exit_ce_loss
                         ce_token_count += valid_exit
+                        
                         if debug:
-                            target_decoded = self.tokenizer.decode([target_token[0].item()]) if target_token[0] != -100 else "[masked]"
-                            print(f"Latent_exit_ce_loss: {latent_exit_ce_loss.item():.6f}, target='{target_decoded}'")
-
-
-
-                    # ===== Alignment Loss (只在最后一个Latent且有下一步时计算) =====
-                    if debug:
-                        print(f"\n[DEBUG] >>> ALIGNMENT LOSS CALCULATION <<<")
+                            print(f"  Latent Exit CE: {latent_exit_ce_loss.item():.6f}")
                     
+                    # Alignment Loss
                     if step_i + 1 < num_steps:
                         next_step_ref_pos = step_positions[:, step_i + 1]
                         valid_mask = (next_step_ref_pos >= 0) & (next_step_ref_pos < ref_input_ids.size(1))
                         
-                        if debug:
-                            print(f"  Target: Align EOT output hidden state with teacher's hidden state at next step start")
-                            print(f"  next_step_ref_pos: {next_step_ref_pos.tolist()}")
-                            print(f"  valid_mask: {valid_mask.tolist()}")
-                        
                         if valid_mask.any():
                             align_loss = torch.tensor(0.0, device=device)
-                            layer_losses = []
                             
                             for layer_idx, (eot_h, ref_h) in enumerate(zip(eot_out.hidden_states, ref_outputs.hidden_states)):
                                 student_hidden = eot_h[:, -1:, :]
@@ -1241,99 +1042,62 @@ class CODI(torch.nn.Module):
                                     if self.distill_loss_div_std:
                                         layer_loss = layer_loss / teacher_valid.std().clamp(min=1e-6)
                                     align_loss = align_loss + layer_loss
-                                    layer_losses.append(layer_loss.item())
                             
                             align_loss = align_loss / len(eot_out.hidden_states)
                             align_loss_total = align_loss_total + align_loss
                             alignment_computed_at_steps.append(step_i)
                             
                             if debug:
-                                print(f"  ★ Alignment Loss value: {align_loss.item():.6f}")
-                        else:
-                            if debug:
-                                print(f"  *** No valid positions for alignment, skipping ***")
-                    else:
-                        if debug:
-                            print(f"  *** Last step, no next step to align to ***")
-                else:
-                    if debug:
-                        print(f"\n[DEBUG] Skipping EOT (Latent sequence continues)")
+                                print(f"  Alignment Loss: {align_loss.item():.6f}")
                 
-
-                # ===== 设置标记：当前步是Latent =====
                 prev_was_latent = True
-                
-                if debug:
-                    print(f"\n[DEBUG] === END OF LATENT STEP {step_i} ===")
         
-        # ========== 7. 预测答案 ==========
+        # ============ 预测答案 ============
         if debug:
-            print("\n" + "=" * 100)
-            print("[DEBUG] " + "=" * 40 + " ANSWER PREDICTION " + "=" * 40)
-            print("=" * 100)
-            print(f"\n[DEBUG] >>> ANSWER GENERATION <<<")
-            print(f"  decoder_input_ids shape: {decoder_input_ids.shape}")
-            for b in range(min(batch_size, 2)):
-                dec_text = self.tokenizer.decode(decoder_input_ids[b], skip_special_tokens=False)
-                print(f"  Sample {b} decoder_input: {dec_text[:100]}...")
+            print(f"\n{'='*80}")
+            print("[ANSWER PREDICTION]")
+            print(f"{'='*80}")
         
-
-        #  新增：答案入口loss 
-        # 如果最后一个step是latent，已在latent_exit_ce_loss中处理（next_step_ids为None时）
-        # 如果最后一个step是显式，需要额外计算
+        # Answer入口CE loss
         if not prev_was_latent:
             ans_first_token = decoder_input_ids[:, 0].clone()
             ans_first_token[ans_first_token == model_pad_id] = -100
             if self.tokenizer.pad_token_id is not None:
                 ans_first_token[ans_first_token == self.tokenizer.pad_token_id] = -100
             
-            # if (ans_first_token != -100).any():
-            #     ans_entry_ce_loss = self.loss_fct(current_logits, ans_first_token)
-            #     ce_loss_total = ce_loss_total + ans_entry_ce_loss
             if (ans_first_token != -100).any():
                 valid_ans_entry = (ans_first_token != -100).sum().item()
                 ans_entry_ce_loss = self.loss_fct_sum(current_logits, ans_first_token)
                 ce_loss_total = ce_loss_total + ans_entry_ce_loss
                 ce_token_count += valid_ans_entry
+                
                 if debug:
-                    target_decoded = self.tokenizer.decode([ans_first_token[0].item()]) if ans_first_token[0] != -100 else "[masked]"
-                    print(f"  ★ Answer Entry CE Loss: {ans_entry_ce_loss.item():.6f}, target='{target_decoded}'")
-
+                    print(f"  Answer Entry CE: {ans_entry_ce_loss.item():.6f}")
+        
         decoder_embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
+        
+        # ★ 更新累积mask（answer tokens）
+        answer_mask = (decoder_input_ids != model_pad_id)
+        if self.tokenizer.pad_token_id is not None:
+            answer_mask = answer_mask & (decoder_input_ids != self.tokenizer.pad_token_id)
+        cumulative_attention_mask = torch.cat([cumulative_attention_mask, answer_mask], dim=1)
+        
+        if debug:
+            print(f"  Final cumulative_mask shape: {cumulative_attention_mask.shape}")
         
         with autocast(device_type='cuda',dtype=torch.bfloat16):
             final_out = self.codi(
                 inputs_embeds=decoder_embds,
                 use_cache=True,
                 output_hidden_states=True,
-                past_key_values=past_key_values
+                past_key_values=past_key_values,
+                attention_mask=cumulative_attention_mask  # ★
             )
         
-        if debug:
-            print(f"  final_out.logits shape: {final_out.logits.shape}")
-        
         # ===== Answer CE Loss =====
-        if debug:
-            print(f"\n[DEBUG] >>> ANSWER CE LOSS <<<")
-            
         ans_logits = final_out.logits[:, :-1, :]
         ans_labels = labels[:, 1:]
         
-        if debug:
-            print(f"  ans_logits shape: {ans_logits.shape}")
-            print(f"  ans_labels shape: {ans_labels.shape}")
-            print(f"  ans_labels (sample 0, first 15): {ans_labels[0, :15].tolist()}")
-            valid_ans_labels = (ans_labels != -100).sum().item()
-            print(f"  valid answer labels: {valid_ans_labels}")
-        
-        # ans_ce_loss = self.loss_fct(
-        #     ans_logits.reshape(-1, ans_logits.size(-1)),
-        #     ans_labels.reshape(-1)
-        # )
-        # ce_loss_total = ce_loss_total + ans_ce_loss
-        # ce_loss_total = ce_loss_total * self.ce_loss_factor
-        # effective_ce_steps += 1
-
         valid_ans_tokens = (ans_labels != -100).sum().item()
         ans_ce_loss = self.loss_fct_sum(
             ans_logits.reshape(-1, ans_logits.size(-1)),
@@ -1341,175 +1105,39 @@ class CODI(torch.nn.Module):
         )
         ce_loss_total = ce_loss_total + ans_ce_loss
         ce_token_count += valid_ans_tokens
-
-        # 归一化：除以总token数
+        
         if ce_token_count > 0:
             ce_loss_total = ce_loss_total / ce_token_count
-
+        
         ce_loss_total = ce_loss_total * self.ce_loss_factor
         effective_ce_steps += 1
         
         if debug:
-            print(f"\n  *** Answer CE Loss = CrossEntropyLoss(ans_logits, ans_labels)")
-            print(f"  *** Answer CE Loss value: {ans_ce_loss.item():.6f} ***")
-            print(f"  Total effective CE steps: {effective_ce_steps}")
-            print(f"  Total effective explain steps: {effective_explain_steps}")
+            print(f"  Answer CE Loss: {ans_ce_loss.item():.6f}")
         
-        # ========== 8. Distillation Loss ==========
-
-        if debug:
-            print(f"\\n[DEBUG] >>> DISTILLATION LOSS (Final Answer) <<<")
-            
+        # ============ Distillation Loss ============
         if "llama" in self.model_name.lower() or "qwen" in self.model_name.lower():
             model_answer_position = model_answer_position + 1
             ref_answer_position = ref_answer_position + 1
         model_answer_position = model_answer_position - 1
         ref_answer_position = ref_answer_position - 1
         
-        if debug:
-            print(f"  model_answer_position: {model_answer_position.tolist()}")
-            print(f"  ref_answer_position: {ref_answer_position.tolist()}")
-            print(f"  Target: Align model's final hidden state with teacher's hidden state at answer position")
-            
-            # ===== 增强Debug: 打印教师对齐点及附近tokens =====
-            print(f"\\n  [TEACHER ALIGNMENT POINT TOKENS]:")
-            for b in range(min(batch_size, 2)):
-                ref_pos = ref_answer_position[b].item()
-                if ref_pos >= 0 and ref_pos < ref_input_ids.size(1):
-                    # 对齐点token
-                    target_token_id = ref_input_ids[b, ref_pos].item()
-                    target_token_decoded = self.tokenizer.decode([target_token_id])
-                    
-                    # 扩大上下文窗口: 前10个token到后5个token
-                    ctx_start = max(0, ref_pos - 10)
-                    ctx_end = min(ref_input_ids.size(1), ref_pos + 6)
-                    ctx_ids = ref_input_ids[b, ctx_start:ctx_end].tolist()
-                    ctx_decoded = self.tokenizer.decode(ctx_ids, skip_special_tokens=False)
-                    
-                    # 逐token打印上下文
-                    print(f"    Sample {b}:")
-                    print(f"      ★ Alignment Point: pos={ref_pos}, token_id={target_token_id}, token='{target_token_decoded}'")
-                    print(f"      Context tokens [{ctx_start}:{ctx_end}]:")
-                    for i, tok_id in enumerate(ctx_ids):
-                        actual_pos = ctx_start + i
-                        tok_str = self.tokenizer.decode([tok_id])
-                        marker = ">>>>" if actual_pos == ref_pos else "    "
-                        print(f"        {marker} pos={actual_pos}: id={tok_id:6d}, token='{tok_str}'")
-                else:
-                    print(f"    Sample {b}: ref_pos={ref_pos} (INVALID or out of range)")
-            
-            # ===== 增强Debug: 打印学生模型对齐点信息 =====
-            print(f"\\n  [STUDENT ALIGNMENT POINT INFO]:")
-            print(f"    Student uses final hidden state (position -1 in final_out)")
-            print(f"    final_out.logits shape: {final_out.logits.shape}")
-            print(f"    final_out.hidden_states[-1] shape: {final_out.hidden_states[-1].shape}")
-            
-            # 学生模型最后位置的预测
-            student_last_logits = final_out.logits[:, -1, :]
-            student_top_probs, student_top_ids = torch.softmax(student_last_logits, dim=-1).topk(5, dim=-1)
-            for b in range(min(batch_size, 2)):
-                top_tokens = [self.tokenizer.decode([tid]) for tid in student_top_ids[b].tolist()]
-                print(f"    Sample {b} student top5 predictions: {list(zip(top_tokens, [f'{p:.4f}' for p in student_top_probs[b].tolist()]))}")
-        
-        # ===== 计算Distill Loss =====
-        layer_distill_losses = []
-        layer_hidden_stats = []  # 记录每层的hidden state统计信息
-        
         for layer_idx, (out_h, ref_h) in enumerate(zip(final_out.hidden_states, ref_outputs.hidden_states)):
             ref_sel = ref_h.gather(1, ref_answer_position.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ref_h.size(-1)))
             out_sel = out_h[:, -1:, :]
             d_loss = self.distill_loss_fct(out_sel, ref_sel.detach())
             
-            # 记录统计信息（用于debug）
-            if debug:
-                layer_hidden_stats.append({
-                    'layer': layer_idx,
-                    'student_norm': out_sel.norm(dim=-1).mean().item(),
-                    'teacher_norm': ref_sel.norm(dim=-1).mean().item(),
-                    'cosine_sim': F.cosine_similarity(out_sel.squeeze(1), ref_sel.squeeze(1), dim=-1).mean().item(),
-                    'l2_dist': (out_sel - ref_sel).pow(2).sum(dim=-1).sqrt().mean().item(),
-                    'loss_before_std': d_loss.item(),
-                })
-            
             if self.distill_loss_div_std:
                 teacher_std = ref_sel.std()
                 d_loss = d_loss / teacher_std.clamp(min=1e-6)
-                if debug and layer_idx < 5:
-                    layer_hidden_stats[-1]['teacher_std'] = teacher_std.item()
-                    layer_hidden_stats[-1]['loss_after_std'] = d_loss.item()
             
             distill_loss_total = distill_loss_total + d_loss
-            layer_distill_losses.append(d_loss.item())
-            
+        
         distill_loss_total = distill_loss_total / len(final_out.hidden_states)
         
-        # ===== 增强Debug: 打印详细的层级Loss信息 =====
-        if debug:
-            print(f"\\n  [LAYER-WISE DISTILL LOSS DETAILS]:")
-            print(f"  Total layers: {len(final_out.hidden_states)}")
-            print(f"  distill_loss_div_std: {self.distill_loss_div_std}")
-            print(f"  distill_loss_type: {self.distill_loss_type}")
-            
-            print(f"\\n  === First 5 Layers (Embedding + Early Layers) ===")
-            for i in range(min(5, len(layer_hidden_stats))):
-                stats = layer_hidden_stats[i]
-                print(f"    Layer {i}:")
-                print(f"      Student norm: {stats['student_norm']:.4f}, Teacher norm: {stats['teacher_norm']:.4f}")
-                print(f"      Cosine similarity: {stats['cosine_sim']:.4f}")
-                print(f"      L2 distance: {stats['l2_dist']:.4f}")
-                print(f"      Loss (before std): {stats['loss_before_std']:.6f}")
-                if 'loss_after_std' in stats:
-                    print(f"      Teacher std: {stats['teacher_std']:.4f}, Loss (after std): {stats['loss_after_std']:.6f}")
-            
-            print(f"\\n  === Middle Layers Summary ===")
-            mid_start = 5
-            mid_end = len(layer_hidden_stats) - 5
-            if mid_end > mid_start:
-                mid_losses = [layer_hidden_stats[i]['loss_before_std'] for i in range(mid_start, mid_end)]
-                mid_cosines = [layer_hidden_stats[i]['cosine_sim'] for i in range(mid_start, mid_end)]
-                print(f"    Layers {mid_start} to {mid_end-1}:")
-                print(f"      Loss range: [{min(mid_losses):.6f}, {max(mid_losses):.6f}], mean: {sum(mid_losses)/len(mid_losses):.6f}")
-                print(f"      Cosine sim range: [{min(mid_cosines):.4f}, {max(mid_cosines):.4f}], mean: {sum(mid_cosines)/len(mid_cosines):.4f}")
-            
-            print(f"\\n  === Last 5 Layers ===")
-            for i in range(max(0, len(layer_hidden_stats) - 5), len(layer_hidden_stats)):
-                stats = layer_hidden_stats[i]
-                print(f"    Layer {i}:")
-                print(f"      Student norm: {stats['student_norm']:.4f}, Teacher norm: {stats['teacher_norm']:.4f}")
-                print(f"      Cosine similarity: {stats['cosine_sim']:.4f}")
-                print(f"      L2 distance: {stats['l2_dist']:.4f}")
-                print(f"      Loss (before std): {stats['loss_before_std']:.6f}")
-                if 'loss_after_std' in stats:
-                    print(f"      Teacher std: {stats['teacher_std']:.4f}, Loss (after std): {stats['loss_after_std']:.6f}")
-            
-            print(f"\\n  === Aggregate Statistics ===")
-            all_losses = layer_distill_losses
-            print(f"    Total distill loss (before factor): {distill_loss_total.item():.6f}")
-            print(f"    Layer losses - min: {min(all_losses):.6f}, max: {max(all_losses):.6f}, mean: {sum(all_losses)/len(all_losses):.6f}")
-            
-            # 检查是否有异常层
-            mean_loss = sum(all_losses) / len(all_losses)
-            std_loss = (sum((x - mean_loss)**2 for x in all_losses) / len(all_losses)) ** 0.5
-            anomaly_layers = [i for i, l in enumerate(all_losses) if abs(l - mean_loss) > 2 * std_loss]
-            if anomaly_layers:
-                print(f"    ⚠️ Anomaly layers (>2 std from mean): {anomaly_layers}")
-                for al in anomaly_layers[:3]:  # 只打印前3个异常层
-                    print(f"      Layer {al}: loss={all_losses[al]:.6f} (mean={mean_loss:.6f}, std={std_loss:.6f})")
-
-        
-        # ========== 9. Reference CE Loss ==========
-        if debug:
-            print(f"\n[DEBUG] >>> REFERENCE CE LOSS <<<")
-            print(f"  Target: Teacher model's CE loss on full CoT sequence")
-            
+        # ============ Reference CE Loss ============
         ref_logits = ref_outputs_with_grad.logits[:, :-1, :]
         ref_labels_shifted = ref_labels[:, 1:]
-        
-        if debug:
-            print(f"  ref_logits shape: {ref_logits.shape}")
-            print(f"  ref_labels_shifted shape: {ref_labels_shifted.shape}")
-            valid_ref_labels = (ref_labels_shifted != -100).sum().item()
-            print(f"  valid reference labels: {valid_ref_labels}")
         
         ref_ce_loss = self.loss_fct(
             ref_logits.reshape(-1, ref_logits.size(-1)),
@@ -1517,16 +1145,7 @@ class CODI(torch.nn.Module):
         )
         ref_ce_loss = ref_ce_loss * self.ref_loss_factor
         
-        if debug:
-            print(f"\n  *** Reference CE Loss = CrossEntropyLoss(ref_logits, ref_labels) * {self.ref_loss_factor}")
-            print(f"  *** Reference CE Loss value: {ref_ce_loss.item():.6f} ***")
-        
-        # ========== 10. 汇总Loss ==========
-        if debug:
-            print("\n" + "=" * 100)
-            print("[DEBUG] " + "=" * 40 + " LOSS SUMMARY " + "=" * 40)
-            print("=" * 100)
-        
+        # ============ 汇总Loss ============
         distill_loss_total = distill_loss_total * self.distill_loss_factor
         explain_loss_total = explain_loss_total * self.explain_loss_factor
         if effective_explain_steps > 0:
@@ -1534,35 +1153,6 @@ class CODI(torch.nn.Module):
         align_loss_total = align_loss_total * self.align_loss_factor
         
         total_loss = ce_loss_total + distill_loss_total + ref_ce_loss + explain_loss_total + align_loss_total
-        
-        if debug:
-            print(f"\n[DEBUG] >>> LOSS FACTORS <<<")
-            print(f"  distill_loss_factor: {self.distill_loss_factor}")
-            print(f"  explain_loss_factor: {self.explain_loss_factor}")
-            print(f"  align_loss_factor: {self.align_loss_factor}")
-            print(f"  ref_loss_factor: {self.ref_loss_factor}")
-            
-            print(f"\n[DEBUG] >>> FINAL LOSS VALUES <<<")
-            print(f"  CE Loss (total):        {ce_loss_total.item():.6f}")
-            print(f"  Distill Loss (scaled):  {distill_loss_total.item():.6f}")
-            print(f"  Reference CE Loss:      {ref_ce_loss.item():.6f}")
-            print(f"  Explain Loss (scaled):  {explain_loss_total.item() if isinstance(explain_loss_total, torch.Tensor) else explain_loss_total:.6f}")
-            print(f"  Align Loss (scaled):    {align_loss_total.item():.6f}")
-            print(f"  -" * 40)
-            print(f"  TOTAL LOSS:             {total_loss.item():.6f}")
-            
-            print(f"\n[DEBUG] >>> MODE HISTORY <<<")
-            print(f"  Modes: {''.join(mode_history)}")
-            print(f"  Entropy history: {[f'{e:.4f}' for e in entropy_history]}")
-            
-            # ========== [修改点5] 打印alignment loss计算位置 ==========
-            print(f"\n[DEBUG] >>> ALIGNMENT LOSS COMPUTATION SUMMARY <<<")
-            print(f"  ★ Alignment computed at steps: {alignment_computed_at_steps}")
-            if alignment_computed_at_steps:
-                print(f"  ★ These correspond to modes: {[mode_history[i] for i in alignment_computed_at_steps]}")
-                print(f"  ★ Total alignment losses computed: {len(alignment_computed_at_steps)}")
-            else:
-                print(f"  ★ No alignment loss computed (no L→S transitions)")
         
         mode_str = ''.join(mode_history)
         if self.print_loss:
@@ -1574,9 +1164,9 @@ class CODI(torch.nn.Module):
         
         if debug:
             print("\n" + "=" * 100)
-            print("[DEBUG] " + "=" * 42 + " FORWARD END " + "=" * 42)
+            print("[DEBUG] FORWARD END")
             print("=" * 100)
-
+        
         return {
             "loss": total_loss,
             "logits": final_out.logits,
@@ -1587,6 +1177,6 @@ class CODI(torch.nn.Module):
             "align_loss": align_loss_total.detach(),
             "mode_history": mode_history,
             "entropy_history": entropy_history,
-            "alignment_computed_at_steps": alignment_computed_at_steps,  # [修改点6] 返回alignment计算位置
+            "alignment_computed_at_steps": alignment_computed_at_steps,
         }
 
