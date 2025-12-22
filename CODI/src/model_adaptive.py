@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict, Sequence, Iterable, Union
 from peft import get_peft_model, PeftModel, PeftConfig
 from safetensors.torch import load_file
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -748,6 +748,11 @@ class CODI(torch.nn.Module):
         cur_entropy = compute_entropy_swir(current_logits)
         swir_state, _, _ = self.swir_controller.update(swir_state, cur_entropy, step=0)
         
+        # ===== 新增：random 模式下随机初始化第一个 step =====
+        if self.baseline_mode == "random":
+            random_init = torch.rand(batch_size, device=device)
+            swir_state.mode = (random_init < self.random_prob).long()
+
         if debug:
             print(f"  Initial entropy: {cur_entropy.tolist()}")
             print(f"  Initial mode: {swir_state.mode.tolist()} (0=Latent, 1=Explicit)")
@@ -882,7 +887,7 @@ class CODI(torch.nn.Module):
                         valid_count = step_attn_mask.sum(dim=1).tolist()
                         print(f"  valid tokens per sample: {valid_count}")
                     
-                    with autocast(dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         step_out = self.codi(
                             inputs_embeds=step_embds,
                             use_cache=True,
@@ -964,23 +969,23 @@ class CODI(torch.nn.Module):
                             top_tokens = [self.tokenizer.decode([tid]) for tid in top_ids[b].tolist()]
                             print(f"  Sample {b} top5 next: {list(zip(top_tokens, [f'{p:.4f}' for p in top_probs[b].tolist()]))}")
                 
-                elif step_len == 1:
-                    if debug:
-                        print(f"  Single token step, just forwarding")
-                    step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
-                    with autocast(dtype=torch.bfloat16):
-                        step_out = self.codi(
-                            inputs_embeds=step_embds,
-                            use_cache=True,
-                            output_hidden_states=True,
-                            past_key_values=past_key_values
-                        )
-                    past_key_values = step_out.past_key_values
-                    last_hidden = step_out.hidden_states[-1][:, -1, :]
-                    current_logits = step_out.logits[:, -1, :]
-                    latent_embd = last_hidden.unsqueeze(1)
-                    if self.use_prj:
-                        latent_embd = self.prj(latent_embd)
+                # elif step_len == 1:
+                #     if debug:
+                #         print(f"  Single token step, just forwarding")
+                #     step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids)
+                #     with autocast(device_type='cuda',dtype=torch.bfloat16):
+                #         step_out = self.codi(
+                #             inputs_embeds=step_embds,
+                #             use_cache=True,
+                #             output_hidden_states=True,
+                #             past_key_values=past_key_values
+                #         )
+                #     past_key_values = step_out.past_key_values
+                #     last_hidden = step_out.hidden_states[-1][:, -1, :]
+                #     current_logits = step_out.logits[:, -1, :]
+                #     latent_embd = last_hidden.unsqueeze(1)
+                #     if self.use_prj:
+                #         latent_embd = self.prj(latent_embd)
                 
                 # ========== 显式模式结束：更新熵和模式 ==========
                 cur_entropy = compute_entropy_swir(current_logits)
@@ -1012,7 +1017,7 @@ class CODI(torch.nn.Module):
                         print(f"  BOT token ID: {self.bot_id}")
                         print(f"  bot_embd shape: {bot_embd.shape}")
                     
-                    with autocast(dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         bot_out = self.codi(
                             inputs_embeds=bot_embd,
                             use_cache=True,
@@ -1037,7 +1042,7 @@ class CODI(torch.nn.Module):
                     print(f"  latent_embd shape: {latent_embd.shape}")
                     print(f"  latent_embd norm: {latent_embd.norm(dim=-1).mean().item():.4f}")
                 
-                with autocast(dtype=torch.bfloat16):
+                with autocast(device_type='cuda',dtype=torch.bfloat16):
                     latent_out = self.codi(
                         inputs_embeds=latent_embd,
                         use_cache=True,
@@ -1100,7 +1105,7 @@ class CODI(torch.nn.Module):
                             decoder_input = self.pj_in(decoder_input)
                         
                         if (explain_labels != -100).sum() > 0:
-                            with autocast(dtype=torch.bfloat16):
+                            with autocast(device_type='cuda',dtype=torch.bfloat16):
                                 dec_out = self.decoder(
                                     inputs_embeds=decoder_input,
                                     attention_mask=explain_attention_mask,
@@ -1157,7 +1162,7 @@ class CODI(torch.nn.Module):
                         print(f"  EOT token ID: {self.eot_id}")
                         print(f"  eot_embd shape: {eot_embd.shape}")
                     
-                    with autocast(dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         eot_out = self.codi(
                             inputs_embeds=eot_embd,
                             use_cache=True,
@@ -1296,7 +1301,7 @@ class CODI(torch.nn.Module):
 
         decoder_embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
         
-        with autocast(dtype=torch.bfloat16):
+        with autocast(device_type='cuda',dtype=torch.bfloat16):
             final_out = self.codi(
                 inputs_embeds=decoder_embds,
                 use_cache=True,

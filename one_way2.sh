@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ========== 配置变量 ==========
-EXPT_NAME="gsm8k_llama1b_SIMCoT_eot"
+EXPT_NAME="gsm8k_llama1b_cot"
 BASE_DIR="/storage/zyj_data/swilatent/SIM-CoT"
 SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
 
 # 训练参数（用于构建 CKPT_DIR 路径）
 MODEL_NAME="Llama-3.2-1B-Instruct"
-NUM_EPOCHS=1
+NUM_EPOCHS=10
 LEARNING_RATE=0.0008
 SEED=11
 
@@ -70,7 +70,7 @@ echo "Starting Training on GPU ${GPUS[0]}..."
 echo "Training log: $TRAIN_LOG"
 cd ${BASE_DIR}/CODI
 
-CUDA_VISIBLE_DEVICES="5,7" torchrun --nproc_per_node=2 --master_port 29505 train_adaptive.py \
+CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29510 train_adaptive.py \
     --output_dir "$SAVE_DIR" \
     --expt_name "$EXPT_NAME" \
     --logging_dir "$SAVE_DIR/logs" \
@@ -79,8 +79,8 @@ CUDA_VISIBLE_DEVICES="5,7" torchrun --nproc_per_node=2 --master_port 29505 train
     --data_name icot \
     --seed ${SEED} \
     --model_max_length 512 \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 64 \
     --bf16 \
     --num_train_epochs ${NUM_EPOCHS} \
     --learning_rate ${LEARNING_RATE} \
@@ -88,7 +88,7 @@ CUDA_VISIBLE_DEVICES="5,7" torchrun --nproc_per_node=2 --master_port 29505 train
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --save_strategy "steps" \
-    --save_steps 10 \
+    --save_steps 100 \
     --save_total_limit 30 \
     --save_safetensors False \
     --weight_decay 0.1 \
@@ -108,14 +108,18 @@ CUDA_VISIBLE_DEVICES="5,7" torchrun --nproc_per_node=2 --master_port 29505 train
     --adaptive_training True\
     --window_e_to_l 5 \
     --window_l_to_e 0 \
-    --exp_mode True \
-    --exp_data_num 100 \
     --baseline_mode random \
     --random_prob 0.5 \
+    --include_last_cot True\
+    --exp_mode True \
+    --exp_data_num 100 \
     --use_decoder \
     --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 0.1 --align_loss_factor 20 --distill_loss_factor 20 \
+    --restore_from ./pretrained/CODI-llama3.2-1b-Instruct/pytorch_model.bin \
     2>&1 | tee "$TRAIN_LOG"
 
+
+    # --use_decoder \
 
     # --exp_mode True \
     # --exp_data_num 10000 \
@@ -193,6 +197,8 @@ CUDA_VISIBLE_DEVICES="${GPUS[0]}" python step4_adaptive_eval.py \
     --window_l_to_e 0 \
     --max_samples 50 \
     2>&1 | tee "$TEST_COT_LOG" &
+    # --max_samples 50 \
+
 PID1=$!
 PIDS+=($PID1)
 
@@ -210,9 +216,11 @@ CUDA_VISIBLE_DEVICES="${GPUS[1]}" python step4_adaptive_step.py \
     --max_switch_count 5 \
     --window_e_to_l 0 \
     --window_l_to_e 0 \
-    --max_latent_steps 3 \
+    --max_latent_steps 1 \
     --max_samples 50 \
     2>&1 | tee "$TEST_ADAPTIVE_LOG" &
+    # --max_samples 50 \
+
 PID2=$!
 PIDS+=($PID2)
 

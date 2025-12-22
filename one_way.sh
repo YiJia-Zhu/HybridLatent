@@ -75,7 +75,7 @@ CUDA_VISIBLE_DEVICES="${GPU}" python train_adaptive.py \
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --save_strategy "steps" \
-    --save_steps 100 \
+    --save_steps 1000 \
     --save_total_limit 30 \
     --save_safetensors False \
     --weight_decay 0.1 \
