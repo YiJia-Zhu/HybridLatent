@@ -1,16 +1,11 @@
 """
 CODI模型 - 集成step4的动态显隐控制器进行训练
 
-新增功能：
-1. 支持 k_step_latent_num 参数：一个 step 对应 k 个 latent token
-2. Explain loss 在每个 step 的所有 k 个 latent 之后计算
-3. 只在最后一个 latent 之后插入 EOT 和计算 align loss
-
 关键改动：
 1. 导入step4中的SwiRModeState和SwiRController
 2. 在每个step末尾基于熵判断是否切换模式
 3. 显式(S): CE loss预测step tokens
-4. 隐式(L): k个latent -> bot→latent×k→eot + alignment loss (对齐下一step开头) + explain loss (decoder预测)
+4. 隐式(L): bot→latent→eot + alignment loss (对齐下一step开头) + explain loss (decoder预测)
 """
 
 import transformers
@@ -153,17 +148,16 @@ class TrainingArguments(transformers.TrainingArguments):
     log_full: bool = field(default=False, metadata={"help": "Log all losses."})
     print_loss: bool = field(default=True)
     max_token_num: int = field(default=1000)
-    # ===== 动态显隐训练参数 =====
+    # ===== 新增: 动态显隐训练参数 (与step4对齐) =====
     adaptive_training: bool = field(default=False, metadata={"help": "启用动态显隐训练"})
     window_e_to_l: int = field(default=5, metadata={"help": "Explicit→Latent需等待的步数"})
     window_l_to_e: int = field(default=0, metadata={"help": "Latent→Explicit需等待的步数"})
     max_switch_count: int = field(default=5, metadata={"help": "最大切换次数"})
     align_loss_factor: float = field(default=1.0, metadata={"help": "对齐loss权重"})
     ce_loss_factor: float = field(default=1.0)
+    # 在 TrainingArguments dataclass 中添加:
     baseline_mode: str = field(default="adaptive", metadata={"help": "训练模式: adaptive 或 random"})
     random_prob: float = field(default=0.5, metadata={"help": "random模式下切换到normal的概率"})
-    # ===== 新增: k_step_latent_num 参数 =====
-    k_step_latent_num: int = field(default=1, metadata={"help": "每个step对应的latent数量"})
 
 def print_trainable_parameters(model):
     trainable_parameters = 0
@@ -231,11 +225,12 @@ def get_steps(
                         break
                     j += 1
                 if end_pos is not None:
+                    # steps_for_sample.append(seq[i:end_pos + 1] + [eos_id])
                     steps_for_sample.append(seq[i:end_pos + 1])
                     i = end_pos + 1
                     continue
             i += 1
-        
+        # >
         max_steps = latent_num
         if len(steps_for_sample) > max_steps:
             kept = steps_for_sample[:max_steps - 1]
@@ -248,10 +243,12 @@ def get_steps(
             merged.append(eos_id)
             kept.append(merged)
             steps_for_sample = kept
+        # <
         elif len(steps_for_sample) < max_steps:
             while len(steps_for_sample) < max_steps:
                 steps_for_sample.append([pad_id])
         else:
+        # =
             ...
 
         result.append(steps_for_sample)
@@ -263,7 +260,9 @@ def pad_steps(
     pad_id: int = 128256
 ):
     max_len = max(len(step) for steps in step_list for step in steps)
+    # 最大的 step 数量
     S_max = max(len(steps) for steps in step_list)
+    # 全局最长的 step 长度
     L_max = max(len(step) for steps in step_list for step in steps)
     
     result: List[List[List[int]]] = []
@@ -307,7 +306,7 @@ class LowRankProjector(nn.Module):
 
 
 # ============================================================================
-# CODI模型 - 集成动态显隐训练 + k_step_latent_num
+# CODI模型 - 集成动态显隐训练
 # ============================================================================
 
 class CODI(torch.nn.Module):
@@ -316,7 +315,7 @@ class CODI(torch.nn.Module):
         self.model_args = model_args
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
-        
+        # import pdb; pdb.set_trace()
         model_wrapper_class = AutoModelForCausalLM 
         if model_args.full_precision:
             self.codi = model_wrapper_class.from_pretrained(
@@ -342,7 +341,7 @@ class CODI(torch.nn.Module):
                         bnb_4bit_quant_type='nf4',
                     )
                 )
-        
+        # import pdb; pdb.set_trace()
         if model_args.use_decoder:
             if model_args.decoder_path:
                 self.decoder = model_wrapper_class.from_pretrained(
@@ -357,7 +356,7 @@ class CODI(torch.nn.Module):
                     self.pj_in = nn.Identity()
                 else:
                     self.pj_in = nn.Linear(self.codi.lm_head.in_features, self.decoder.lm_head.in_features)
-                
+                # self.pj_out = nn.Linear(self.decoder.lm_head.out_features, self.codi.lm_head.out_features)
                 input_dim = self.decoder.lm_head.out_features
                 output_dim = self.codi.lm_head.out_features
                 if input_dim == output_dim:
@@ -373,6 +372,14 @@ class CODI(torch.nn.Module):
                         use_flash_attention_2=False,
                         resume_download=True,
                     )
+        
+        # import pdb; pdb.set_trace()
+
+        # saved_weights = torch.load(
+        #     '/fs-computility/mllm/shared/weixilin/coconut/ckpts/gsm_cot/gsm-cot/checkpoint_13', map_location=torch.device(self.codi.device)
+        # )
+        # self.codi.load_state_dict(saved_weights, strict=False)
+        
 
         ori_vocab_size = self.codi.config.vocab_size
         self.training = self.model_args.train
@@ -413,6 +420,8 @@ class CODI(torch.nn.Module):
         # Losses
         self.print_loss = training_args.print_loss
         self.ref_loss_factor = training_args.ref_loss_factor
+
+        # Cross Entropy Loss
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100) 
         self.loss_fct_sum = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
 
@@ -429,24 +438,22 @@ class CODI(torch.nn.Module):
 
         # Explain Loss
         self.explain_loss_factor = training_args.explain_loss_factor
+        # general 
         self.fix_attn_mask = training_args.fix_attn_mask
 
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             self.tokenizer.pad_token_id = self.pad_token_id
 
-        # ===== 动态显隐训练 =====
+        # ===== 新增: 动态显隐训练 =====
         self.adaptive_training = getattr(training_args, 'adaptive_training', False)
         self.align_loss_factor = getattr(training_args, 'align_loss_factor', 1.0)
         self.ce_loss_factor = getattr(training_args, 'ce_loss_factor', 1.0)
+
         self.baseline_mode = getattr(training_args, 'baseline_mode', 'adaptive')
         self.random_prob = getattr(training_args, 'random_prob', 0.5)
         
-        # ===== 新增: k_step_latent_num =====
-        self.k_step_latent_num = getattr(training_args, 'k_step_latent_num', 1)
-        print(f"[CODI Init] k_step_latent_num = {self.k_step_latent_num}")
-        
-        # 初始化SwiR控制器
+        # 初始化SwiR控制器 (与step4对齐)
         self.swir_controller = SwiRController(
             window_e_to_l=getattr(training_args, 'window_e_to_l', 5),
             window_l_to_e=getattr(training_args, 'window_l_to_e', 0),
@@ -463,12 +470,12 @@ class CODI(torch.nn.Module):
             elif "gpt2" in model_name.lower():
                 try:
                     return model.get_base_model().transformer.wte
-                except Exception:
+                except Exception: # no lora
                     return model.transformer.wte
             else:
                 try:
                     return model.get_base_model().model.embed_tokens
-                except Exception:
+                except Exception: # no lora
                     return model.model.embed_tokens
         except AttributeError:
             if "pythia" in model_name:
@@ -500,7 +507,10 @@ class CODI(torch.nn.Module):
             print(f"Finished loading from {restore_path}")
 
     def find_step_positions_in_ref(self, ref_input_ids, start_ids=(2501, 1134), pad_id=128256):
-        """找到每个step在ref_input_ids中的位置（start token的位置）"""
+        """
+        找到每个step在ref_input_ids中的位置（start token的位置）
+        返回: [batch, num_steps] 的位置tensor
+        """
         batch_size = ref_input_ids.size(0)
         device = ref_input_ids.device
         
@@ -513,10 +523,11 @@ class CODI(torch.nn.Module):
                     step_positions.append(i)
             positions.append(step_positions)
         
+        # Pad to same length
         max_steps = max(len(p) for p in positions) if positions else 0
         padded = []
         for p in positions:
-            p_padded = p + [-1] * (max_steps - len(p))
+            p_padded = p + [-1] * (max_steps - len(p))  # -1表示无效位置
             padded.append(p_padded)
         
         return torch.tensor(padded, dtype=torch.long, device=device)
@@ -542,30 +553,39 @@ class CODI(torch.nn.Module):
         ref_labels: torch.LongTensor = None,
         step: int = None,
         step_ratio: float = None,
-        num_steps: Optional[torch.LongTensor] = None,
         debug: bool = False,
     ):
         """
-        修改版Forward：支持 k_step_latent_num 参数
-        - 一个 step 对应 k 个 latent token
-        - Explain loss 在所有 k 个 latent 之后计算
-        - Align loss 只在最后一个 latent 的 eot 之后计算
+        修复版Forward：正确处理PAD和attention_mask
+        - 方案A：维护累积的attention_mask
+        - 方案B：动态去除trailing PAD
         """
         
-        # ============ 辅助函数 ============
+        # ============ 辅助函数：去除trailing PAD ============
         def trim_trailing_pads(token_ids, pad_id):
-            """去除batch内所有样本共同的trailing PAD"""
+            """
+            去除batch内所有样本共同的trailing PAD
+            返回: trimmed_ids, valid_mask
+            """
             batch_size, seq_len = token_ids.shape
+            
+            # 找到每个样本最后一个非PAD位置
             is_not_pad = (token_ids != pad_id)
             if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != pad_id:
                 is_not_pad = is_not_pad & (token_ids != self.tokenizer.pad_token_id)
             
-            valid_lens = is_not_pad.long().sum(dim=1)
+            # 计算每个样本的有效长度
+            valid_lens = is_not_pad.long().sum(dim=1)  # [B]
+            
             if valid_lens.max().item() == 0:
+                # 全是PAD，返回单个PAD
                 return token_ids[:, :1], torch.zeros(batch_size, 1, dtype=torch.bool, device=token_ids.device)
             
+            # 裁剪到batch内最大有效长度
             max_valid_len = valid_lens.max().item()
             trimmed_ids = token_ids[:, :max_valid_len]
+            
+            # 创建mask：[B, max_valid_len]
             valid_mask = is_not_pad[:, :max_valid_len]
             
             return trimmed_ids, valid_mask
@@ -599,7 +619,7 @@ class CODI(torch.nn.Module):
         
         if debug:
             print("=" * 100)
-            print(f"[DEBUG] FORWARD START - k_step_latent_num = {self.k_step_latent_num}")
+            print("[DEBUG] FORWARD START - With Cumulative Attention Mask")
             print("=" * 100)
         
         # ============ 解析步骤 ============
@@ -617,21 +637,8 @@ class CODI(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported model: {self.model_name}")
         
-
-
-        # batch size 为1的情况不需要PAD
-
-        if num_steps is None:
-            # num_steps = sum(1 for step_cot in steps_list[0] if step_cot[0] != model_pad_id)
-            num_steps = len(steps_pad_list[0]) if steps_pad_list else self.num_latent
-        elif isinstance(num_steps, torch.Tensor):
-            # num_steps 是 Tensor，取第一个元素的值（假设 batch 内所有样本 step 数相同）
-            num_steps = num_steps[0].item()
-            
-        max_available_steps = len(steps_pad_list[0]) if steps_pad_list else self.num_latent
-        num_steps = min(num_steps, max_available_steps)
-            
-                
+        num_steps = len(steps_pad_list[0]) if steps_pad_list else self.num_latent
+        
         if 'llama' in self.model_name.lower() or 'qwen' in self.model_name.lower():
             step_positions = self.find_step_positions_in_ref(
                 ref_input_ids, start_ids=(2501, 1134), pad_id=model_pad_id
@@ -645,7 +652,7 @@ class CODI(torch.nn.Module):
             pad_cols = num_steps - step_positions.size(1)
             step_positions = F.pad(step_positions, (0, pad_cols), value=-1)
         
-        # ============ Encode问题 ============
+        # ============ Encode问题 + 初始化累积mask ============
         past_key_values = None
         outputs = self.codi(
             input_ids=encoder_input_ids,
@@ -657,9 +664,9 @@ class CODI(torch.nn.Module):
         last_hidden = outputs.hidden_states[-1][:, -1, :]
         current_logits = outputs.logits[:, -1, :]
         
-        # 初始化累积attention_mask
+        # ★ 初始化累积attention_mask
         if encoder_attention_mask is not None:
-            cumulative_attention_mask = encoder_attention_mask.clone()
+            cumulative_attention_mask = encoder_attention_mask.clone()  # [B, Q_len]
         else:
             cumulative_attention_mask = torch.ones(
                 batch_size, encoder_input_ids.size(1), 
@@ -705,7 +712,7 @@ class CODI(torch.nn.Module):
         # ============ 逐Step推理 ============
         if debug:
             print("\n" + "=" * 100)
-            print("[DEBUG] STEP-BY-STEP PROCESSING")
+            print("[DEBUG] STEP-BY-STEP PROCESSING WITH ATTENTION MASK")
             print("=" * 100)
         
         for step_i in range(num_steps):
@@ -719,14 +726,14 @@ class CODI(torch.nn.Module):
                 print(f"[STEP {step_i}] MODE: {'LATENT' if is_latent_mode else 'EXPLICIT'}")
                 print(f"{'='*80}")
             
-            # 收集当前step tokens
+            # ===== 收集当前step tokens =====
             current_step_list = []
             for b in range(batch_size):
                 current_step_list.append(steps_pad_list[b][step_i])
             current_step_list = dedup_trailing_pads(current_step_list, pad_id=model_pad_id)
             current_step_ids = torch.tensor(current_step_list, dtype=torch.long, device=device)
             
-            # 收集下一step
+            # 收集下一step（用于alignment/explain）
             next_step_ids = None
             if step_i + 1 < num_steps:
                 next_step_list = []
@@ -735,13 +742,19 @@ class CODI(torch.nn.Module):
                 next_step_list = dedup_trailing_pads(next_step_list, pad_id=model_pad_id)
                 next_step_ids = torch.tensor(next_step_list, dtype=torch.long, device=device)
             
-            # Trim trailing PAD
+            # ============================================================
+            # ★★★ Trim trailing PAD ★★★
+            # ============================================================
             current_step_ids_trimmed, current_step_mask = trim_trailing_pads(current_step_ids, model_pad_id)
             
             if debug:
                 print(f"\n[PAD TRIMMING]")
                 print(f"  Original shape: {current_step_ids.shape}")
                 print(f"  Trimmed shape:  {current_step_ids_trimmed.shape}")
+                print(f"  Mask shape:     {current_step_mask.shape}")
+                print(f"  Sample 0 mask:  {current_step_mask[0].tolist()}")
+            
+            # ============================================================
             
             if not is_latent_mode:
                 # ===== 显式模式 (S) =====
@@ -750,7 +763,7 @@ class CODI(torch.nn.Module):
                 
                 step_len = current_step_ids_trimmed.size(1)
                 
-                # 入口CE loss
+                # ===== 处理step入口的CE loss =====
                 if step_len >= 1 and not prev_was_latent:
                     first_token = current_step_ids_trimmed[:, 0].clone()
                     first_token[first_token == model_pad_id] = -100
@@ -768,25 +781,33 @@ class CODI(torch.nn.Module):
                         if debug:
                             print(f"  Explicit Entry CE: {explicit_entry_ce_loss.item():.6f}")
                 
-                # Forward step tokens
+                # ===== Forward step tokens =====
                 if step_len > 1:
                     step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids_trimmed)
+                    
+                    # ★★★ 方案A：更新累积mask ★★★
                     cumulative_attention_mask = torch.cat([
                         cumulative_attention_mask, 
                         current_step_mask
                     ], dim=1)
                     
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    if debug:
+                        print(f"\n[CUMULATIVE MASK UPDATE]")
+                        print(f"  New cumulative_mask shape: {cumulative_attention_mask.shape}")
+                        print(f"  Sample 0 mask (last 20): {cumulative_attention_mask[0, -20:].tolist()}")
+                    
+                    # Forward with attention_mask
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         step_out = self.codi(
                             inputs_embeds=step_embds,
                             use_cache=True,
                             output_hidden_states=True,
                             past_key_values=past_key_values,
-                            attention_mask=cumulative_attention_mask
+                            attention_mask=cumulative_attention_mask  # ★ 传入完整mask
                         )
                     past_key_values = step_out.past_key_values
                     
-                    # CE Loss
+                    # ===== CE Loss =====
                     step_logits = step_out.logits[:, :-1, :]
                     step_targets = current_step_ids_trimmed[:, 1:]
                     
@@ -807,7 +828,7 @@ class CODI(torch.nn.Module):
                         effective_ce_steps += 1
                         
                         if debug:
-                            print(f"  Step CE Loss: {ce_loss.item():.6f}")
+                            print(f"  Step CE Loss: {ce_loss.item():.6f} (valid_tokens={valid_step_tokens})")
                     
                     last_hidden = step_out.hidden_states[-1][:, -1, :]
                     current_logits = step_out.logits[:, -1, :]
@@ -816,19 +837,22 @@ class CODI(torch.nn.Module):
                         latent_embd = self.prj(latent_embd)
                 
                 elif step_len == 1:
+                    # 单token step
                     step_embds = self.get_embd(self.codi, self.model_name)(current_step_ids_trimmed)
+                    
+                    # ★ 更新累积mask
                     cumulative_attention_mask = torch.cat([
                         cumulative_attention_mask, 
                         current_step_mask
                     ], dim=1)
                     
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         step_out = self.codi(
                             inputs_embeds=step_embds,
                             use_cache=True,
                             output_hidden_states=True,
                             past_key_values=past_key_values,
-                            attention_mask=cumulative_attention_mask
+                            attention_mask=cumulative_attention_mask  # ★
                         )
                     past_key_values = step_out.past_key_values
                     last_hidden = step_out.hidden_states[-1][:, -1, :]
@@ -844,59 +868,55 @@ class CODI(torch.nn.Module):
                 prev_was_latent = False
             
             else:
-                # ===== 隐式模式 (L) - k个latent =====
+                # ===== 隐式模式 (L) =====
                 if debug:
-                    print(f"\n[LATENT MODE] - Generating {self.k_step_latent_num} latents")
+                    print(f"\n[LATENT MODE]")
                 
                 # ===== 1. BOT token (只在第一个L时) =====
                 if not prev_was_latent:
                     bot_ids = torch.full((batch_size, 1), self.bot_id, dtype=torch.long, device=device)
                     bot_embd = self.get_embd(self.codi, self.model_name)(bot_ids)
+                    
+                    # ★ BOT是有效token，mask=1
                     bot_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
                     cumulative_attention_mask = torch.cat([cumulative_attention_mask, bot_mask], dim=1)
                     
                     if debug:
                         print(f"  BOT added, new mask shape: {cumulative_attention_mask.shape}")
                     
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         bot_out = self.codi(
                             inputs_embeds=bot_embd,
                             use_cache=True,
                             output_hidden_states=True,
                             past_key_values=past_key_values,
-                            attention_mask=cumulative_attention_mask
+                            attention_mask=cumulative_attention_mask  # ★
                         )
                     past_key_values = bot_out.past_key_values
                 
-                # ===== 2. 连续生成 k 个 Latent embeddings =====
-                for k_idx in range(self.k_step_latent_num):
-                    if debug:
-                        print(f"  [Latent {k_idx+1}/{self.k_step_latent_num}]")
-                    
-                    latent_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-                    cumulative_attention_mask = torch.cat([cumulative_attention_mask, latent_mask], dim=1)
-                    
-                    if debug:
-                        print(f"  LATENT added, new mask shape: {cumulative_attention_mask.shape}")
-                    
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
-                        latent_out = self.codi(
-                            inputs_embeds=latent_embd,
-                            use_cache=True,
-                            output_hidden_states=True,
-                            past_key_values=past_key_values,
-                            attention_mask=cumulative_attention_mask
-                        )
-                    past_key_values = latent_out.past_key_values
-                    last_hidden = latent_out.hidden_states[-1][:, -1, :]
-                    
-                    # 更新latent_embd供下一个latent使用
-                    latent_embd = last_hidden.unsqueeze(1)
-                    if self.use_prj:
-                        latent_embd = self.prj(latent_embd)
+                # ===== 2. Latent embedding =====
+                # ★ Latent也是有效位置，mask=1
+                latent_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+                cumulative_attention_mask = torch.cat([cumulative_attention_mask, latent_mask], dim=1)
+                
+                if debug:
+                    print(f"  LATENT added, new mask shape: {cumulative_attention_mask.shape}")
+                
+                with autocast(device_type='cuda',dtype=torch.bfloat16):
+                    latent_out = self.codi(
+                        inputs_embeds=latent_embd,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        past_key_values=past_key_values,
+                        attention_mask=cumulative_attention_mask  # ★
+                    )
+                past_key_values = latent_out.past_key_values
+                last_hidden = latent_out.hidden_states[-1][:, -1, :]
+                latent_embd = last_hidden.unsqueeze(1)
+                if self.use_prj:
+                    latent_embd = self.prj(latent_embd)
                 
                 # ===== 3. Explain Loss =====
-                # 此时 latent_embd 是最后一个 latent 的输出（已经过 prj），直接使用
                 if self.model_args.use_decoder:
                     current_step_len = current_step_ids_trimmed.size(1)
                     if current_step_len > 0:
@@ -922,7 +942,7 @@ class CODI(torch.nn.Module):
                             decoder_input = self.pj_in(decoder_input)
                         
                         if (explain_labels != -100).sum() > 0:
-                            with autocast(device_type='cuda', dtype=torch.bfloat16):
+                            with autocast(device_type='cuda',dtype=torch.bfloat16):
                                 dec_out = self.decoder(
                                     inputs_embeds=decoder_input,
                                     attention_mask=explain_attention_mask,
@@ -945,7 +965,7 @@ class CODI(torch.nn.Module):
                                 effective_explain_steps += 1
                                 
                                 if debug:
-                                    print(f"  Explain Loss (after {self.k_step_latent_num} latents): {explain_loss.item():.6f}")
+                                    print(f"  Explain Loss: {explain_loss.item():.6f}")
                 
                 # ===== 4. 判断是否是最后一个L =====
                 current_logits = latent_out.logits[:, -1, :]
@@ -961,19 +981,21 @@ class CODI(torch.nn.Module):
                 if is_last_latent:
                     eot_ids = torch.full((batch_size, 1), self.eot_id, dtype=torch.long, device=device)
                     eot_embd = self.get_embd(self.codi, self.model_name)(eot_ids)
+                    
+                    # ★ EOT是有效token，mask=1
                     eot_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
                     cumulative_attention_mask = torch.cat([cumulative_attention_mask, eot_mask], dim=1)
                     
                     if debug:
                         print(f"  EOT added, new mask shape: {cumulative_attention_mask.shape}")
                     
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    with autocast(device_type='cuda',dtype=torch.bfloat16):
                         eot_out = self.codi(
                             inputs_embeds=eot_embd,
                             use_cache=True,
                             output_hidden_states=True,
                             past_key_values=past_key_values,
-                            attention_mask=cumulative_attention_mask
+                            attention_mask=cumulative_attention_mask  # ★
                         )
                     past_key_values = eot_out.past_key_values
                     current_logits = eot_out.logits[:, -1, :]
@@ -1054,7 +1076,7 @@ class CODI(torch.nn.Module):
         
         decoder_embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
         
-        # 更新累积mask
+        # ★ 更新累积mask（answer tokens）
         answer_mask = (decoder_input_ids != model_pad_id)
         if self.tokenizer.pad_token_id is not None:
             answer_mask = answer_mask & (decoder_input_ids != self.tokenizer.pad_token_id)
@@ -1063,16 +1085,16 @@ class CODI(torch.nn.Module):
         if debug:
             print(f"  Final cumulative_mask shape: {cumulative_attention_mask.shape}")
         
-        with autocast(device_type='cuda', dtype=torch.bfloat16):
+        with autocast(device_type='cuda',dtype=torch.bfloat16):
             final_out = self.codi(
                 inputs_embeds=decoder_embds,
                 use_cache=True,
                 output_hidden_states=True,
                 past_key_values=past_key_values,
-                attention_mask=cumulative_attention_mask
+                attention_mask=cumulative_attention_mask  # ★
             )
         
-        # Answer CE Loss
+        # ===== Answer CE Loss =====
         ans_logits = final_out.logits[:, :-1, :]
         ans_labels = labels[:, 1:]
         
@@ -1157,3 +1179,4 @@ class CODI(torch.nn.Module):
             "entropy_history": entropy_history,
             "alignment_computed_at_steps": alignment_computed_at_steps,
         }
+

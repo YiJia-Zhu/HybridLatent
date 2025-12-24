@@ -22,18 +22,33 @@ export CUDA_VISIBLE_DEVICES="6"
 python step4_adaptive_step.py \
     --model_type codi \
     --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_cot/Llama-3.2-1B-Instruct/ep_1/lr_0.0008/seed_11/checkpoint-900 \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_param/Llama-3.2-1B-Instruct/ep_3/lr_0.0008/seed_11/checkpoint-2000 \
     --data_name gsm8k \
     --bf16 \
     --baseline_mode adaptive \
     --prj_dim 2048 \
     --max_switch_count 5 \
-    --window_e_to_l 5 \
+    --window_e_to_l 0 \
     --window_l_to_e 0 \
-    --max_latent_steps 3 \
+    --max_latent_steps 1 \
     --max_samples 50
 
 
+export CUDA_VISIBLE_DEVICES="3"
+python step4_adaptive_step.py \
+    --model_type codi \
+    --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
+    --ckpt_dir /storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts/gsm8k_llama1b_cot/Llama-3.2-1B-Instruct/ep_10/lr_0.0008/seed_11/checkpoint-1000 \
+    --data_name gsm8k \
+    --bf16 \
+    --baseline_mode random \
+    --random_prob 1 \
+    --prj_dim 2048 \
+    --max_switch_count 0 \
+    --window_e_to_l 0 \
+    --window_l_to_e 0 \
+    --max_latent_steps 0 \
+    --max_samples 50
 
 
 
