@@ -1,34 +1,5 @@
 """
-阶段3: 半显半隐式推理 (SwiReasoning风格控制) - 数据集评估版本
-
-扩展功能:
-- 支持多种数据集 (gsm8k, gsm-hard, multi-arith, svamp, commonsense)
-- 计算测试精度
-- 统计 token 分布 (Normal mode vs Latent mode)
-- 记录两种模式的平均时间
-
-使用方法:
-    # CODI 数据集评估
-    python step4_adaptive_eval.py \
-        --model_type codi \
-        --base_model_path ./CODI/pretrained/Llama-3.2-1B-Instruct \
-        --ckpt_dir ./CODI/pretrained/CODI-llama3.2-1b-Instruct \
-        --predictor_path checkpoints/entropy_predictor.pt \
-        --data_name gsm8k \
-        --bf16 \
-        --batch_size 8
-    
-    # Coconut 数据集评估
-    python step4_adaptive_eval.py \
-        --model_type coconut \
-        --base_model_path ./Coconut/pretrained/gpt2 \
-        --checkpoint_path ./Coconut/ckpts/gsm-coconut-gpt2/checkpoint_6 \
-        --predictor_path checkpoints/entropy_predictor.pt \
-        --data_name gsm8k \
-        --baseline_mode adaptive \
-        --max_switch_count 5 \
-        --window_e_to_l 5 \
-        --window_l_to_e 0
+阶段3: 半显半隐式推理 (SwiReasoning风格控制) - 数据集评估版本 k
 """
 
 import torch
@@ -460,7 +431,7 @@ def codi_adaptive_generate_with_timing(
     in_latent_region = False
     
     # ========== 新增：追踪是否在 step 内部 (<<...>> 之间) ==========
-    in_step = False
+    in_step = True
     
     def get_embd(token_ids):
         return model.get_embd(model.codi, model.model_name)(token_ids)
@@ -594,13 +565,9 @@ def codi_adaptive_generate_with_timing(
             current_latent_group_count = 0  # ← 重置group计数
 
             
-            # ===== 新增：检测 step 边界 =====
+            # ===== 检测 step 边界 =====
             token_id = next_token_ids[0].item()
-            if token_id in step_start_ids:
-                in_step = True
-                if verbose:
-                    print(f"[Step {step}] Detected step start '<<', in_step=True")
-            elif token_id == step_end_id:
+            if token_id == step_end_id:
                 in_step = False
                 if verbose:
                     print(f"[Step {step}] Detected step end '>>', in_step=False")
@@ -675,7 +642,8 @@ def codi_adaptive_generate_with_timing(
         mode, to_normal, to_soft, cur_entropy = controller.step(
             last_hidden, step + 1, logits, end_token_mask, at_step_boundary
         )
-        
+
+        in_step = True  # 判断完成后，立即禁止切换直到下一个>>
         # ========== 3.7 处理模式切换 ==========
         can_exit_latent = (current_latent_group_count % k_step_latent_num == 0) or (consecutive_latent_count >= max_latent_steps)
 
@@ -1135,8 +1103,8 @@ def main():
 
     # 消融实验
     parser.add_argument("--baseline_mode", type=str, default="adaptive", 
-                        choices=["adaptive", "random"],
-                        help="推理模式: adaptive(默认), random(随机/全显/全隐)")
+                        choices=["adaptive", "random", "alternating"],
+                        help="推理模式: adaptive(自适应), random(随机), alternating(固定交替SLSL)")
     parser.add_argument("--random_prob", type=float, default=0.5,
                         help="随机模式下切换到 normal mode 的概率。设置 1.0 为全显, 0.0 为全隐。")
     

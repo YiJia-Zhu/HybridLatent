@@ -1,14 +1,6 @@
 """
-EntropyPredictor 模块
+Swicontrol 模块
 
-从 hidden states 预测归一化熵值，用于自适应推理控制
-支持 SwiReasoning 风格的模式切换
-
-包含:
-- EntropyPredictor: MLP 熵预测器
-- EntropyDataset: 熵数据集类
-- AdaptiveThinkingController: 自适应思考控制器 (legacy)
-- CoconutWithEntropyPredictor: 集成了熵预测的 Coconut 包装器 (legacy)
 """
 
 import torch
@@ -542,14 +534,14 @@ class AdaptiveController:
             if logits is None:
                 raise ValueError("logits required when use_predicted_entropy=False")
             return compute_entropy_swir(logits)
-    
+        
     def step(
         self,
         hidden_states: torch.Tensor,
         step: int,
         logits: Optional[torch.Tensor] = None,
         end_token_mask: Optional[torch.Tensor] = None,
-        at_step_boundary: Optional[torch.Tensor] = None,  # 新增
+        at_step_boundary: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """更新模式状态并返回当前模式、切换事件和熵"""
         if self.state is None:
@@ -559,42 +551,64 @@ class AdaptiveController:
         batch_size = hidden_states.shape[0]
         
         if self.baseline_mode == "random":
-            if step == 0 and self.is_initialized:
-                random_values = torch.rand(batch_size, device=device)
-                self.state.mode = (random_values < self.random_prob).long()
-                
-            random_switch = torch.rand(batch_size, device=device)
+            to_normal = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            to_soft = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            cur_entropy = torch.zeros(batch_size, dtype=torch.float, device=device)
             
-            to_normal_new = (random_switch < self.random_prob) & (self.state.mode == 0)
-            to_soft_new = (random_switch >= self.random_prob) & (self.state.mode == 1) & (~self.state.locked_normal)
+            # step=0 时保持 normal，不切换
+            if step == 0:
+                return self.state.mode.clone(), to_normal, to_soft, cur_entropy
             
-            # ===== 新增：random 模式也只在 step 边界切换到 soft =====
+            random_val = torch.rand(batch_size, device=device)
+            
+            want_soft = (self.state.mode == 1) & (random_val >= self.random_prob) & (~self.state.locked_normal)
+            to_normal = (self.state.mode == 0) & (random_val < self.random_prob)
+            
             if at_step_boundary is not None:
-                to_soft_new = to_soft_new & at_step_boundary
-            # ======================================================
+                to_soft = want_soft & at_step_boundary
+            else:
+                to_soft = want_soft
             
             mode = self.state.mode.clone()
-            mode = torch.where(to_normal_new, torch.ones_like(mode), mode)
-            mode = torch.where(to_soft_new, torch.zeros_like(mode), mode)
-            
+            mode = torch.where(to_normal, torch.ones_like(mode), mode)
+            mode = torch.where(to_soft, torch.zeros_like(mode), mode)
             self.state.mode = mode
             
-            to_normal = to_normal_new
-            to_soft = to_soft_new
-            cur_entropy = torch.zeros(batch_size, dtype=torch.float, device=device) 
+            return mode, to_normal, to_soft, cur_entropy
+
+        elif self.baseline_mode == "alternating":
+            to_normal = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            to_soft = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            cur_entropy = torch.zeros(batch_size, dtype=torch.float, device=device)
+            
+            # step=0 时保持 normal，不切换
+            if step == 0:
+                return self.state.mode.clone(), to_normal, to_soft, cur_entropy
+            
+            # step >= 1: 交替切换
+            want_soft = (self.state.mode == 1) & (~self.state.locked_normal)
+            to_normal = (self.state.mode == 0)
+            
+            if at_step_boundary is not None:
+                to_soft = want_soft & at_step_boundary
+            else:
+                to_soft = want_soft
+            
+            mode = self.state.mode.clone()
+            mode = torch.where(to_normal, torch.ones_like(mode), mode)
+            mode = torch.where(to_soft, torch.zeros_like(mode), mode)
+            self.state.mode = mode
             
             return mode, to_normal, to_soft, cur_entropy
         
         elif self.baseline_mode == "adaptive":
             cur_entropy = self.get_entropy(hidden_states, logits)
-            # ===== 修改：传递 at_step_boundary =====
             self.state, to_normal, to_soft = self.controller.update(
                 self.state, cur_entropy, step, end_token_mask, at_step_boundary
             )
-            # ========================================
-            
             return self.state.mode.clone(), to_normal, to_soft, cur_entropy
         
         else:
             raise ValueError(f"Unknown baseline_mode: {self.baseline_mode}")
-
+        
+    

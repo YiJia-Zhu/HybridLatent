@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ========== 配置变量 ==========
-EXPT_NAME="gsm8k_llama1b_param"
+EXPT_NAME="gsm8k_llama1b_alternating"
 BASE_DIR="/storage/zyj_data/swilatent/SIM-CoT"
 SAVE_DIR="/storage/zyj_data/swilatent/SIM-CoT/CODI/ckpts"
 
@@ -79,8 +79,8 @@ CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29510 train
     --data_name icot \
     --seed ${SEED} \
     --model_max_length 512 \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 8 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 16 \
     --bf16 \
     --num_train_epochs ${NUM_EPOCHS} \
     --learning_rate ${LEARNING_RATE} \
@@ -108,11 +108,11 @@ CUDA_VISIBLE_DEVICES="6,7" torchrun --nproc_per_node=2 --master_port 29510 train
     --adaptive_training True\
     --window_e_to_l 5 \
     --window_l_to_e 0 \
-    --baseline_mode random \
+    --baseline_mode alternating \
     --random_prob 0.5 \
     --include_last_cot True\
     --use_decoder \
-    --k_step_latent_num 1 \
+    --k_step_latent_num 3 \
     --ce_loss_factor 1 --ref_loss_factor 1 --explain_loss_factor 0.1 --align_loss_factor 20 --distill_loss_factor 20 \
     2>&1 | tee "$TRAIN_LOG"
 

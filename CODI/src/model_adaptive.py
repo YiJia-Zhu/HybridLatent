@@ -154,13 +154,13 @@ class TrainingArguments(transformers.TrainingArguments):
     print_loss: bool = field(default=True)
     max_token_num: int = field(default=1000)
     # ===== 动态显隐训练参数 =====
-    adaptive_training: bool = field(default=False, metadata={"help": "启用动态显隐训练"})
+    adaptive_training: bool = field(default=True, metadata={"help": "启用动态显隐训练"})
     window_e_to_l: int = field(default=5, metadata={"help": "Explicit→Latent需等待的步数"})
     window_l_to_e: int = field(default=0, metadata={"help": "Latent→Explicit需等待的步数"})
     max_switch_count: int = field(default=5, metadata={"help": "最大切换次数"})
     align_loss_factor: float = field(default=1.0, metadata={"help": "对齐loss权重"})
     ce_loss_factor: float = field(default=1.0)
-    baseline_mode: str = field(default="adaptive", metadata={"help": "训练模式: adaptive 或 random"})
+    baseline_mode: str = field(default="adaptive", metadata={"help": "训练模式: adaptive 或 random 或 alternating"})
     random_prob: float = field(default=0.5, metadata={"help": "random模式下切换到normal的概率"})
     # ===== 新增: k_step_latent_num 参数 =====
     k_step_latent_num: int = field(default=1, metadata={"help": "每个step对应的latent数量"})
@@ -436,7 +436,7 @@ class CODI(torch.nn.Module):
             self.tokenizer.pad_token_id = self.pad_token_id
 
         # ===== 动态显隐训练 =====
-        self.adaptive_training = getattr(training_args, 'adaptive_training', False)
+        self.adaptive_training = getattr(training_args, 'adaptive_training', True)
         self.align_loss_factor = getattr(training_args, 'align_loss_factor', 1.0)
         self.ce_loss_factor = getattr(training_args, 'ce_loss_factor', 1.0)
         self.baseline_mode = getattr(training_args, 'baseline_mode', 'adaptive')
@@ -576,6 +576,18 @@ class CODI(torch.nn.Module):
                 random_val = torch.rand(batch_size, device=device)
                 if step_idx == 0:
                     swir_state.mode = (random_val < self.random_prob).long()
+                elif self.baseline_mode == "alternating":
+                    # 新增：固定交替模式 S-L-S-L...
+                    # Step 0: S, Step 1: L, Step 2: S, Step 3: L, ...
+                    if step_idx % 2 == 0:
+                        swir_state.mode = torch.ones_like(swir_state.mode)   # S (显式)
+                    else:
+                        swir_state.mode = torch.zeros_like(swir_state.mode)  # L (隐式)
+                    
+                    return swir_state, \
+                        torch.zeros(batch_size, dtype=torch.bool, device=device), \
+                        torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
                 else:
                     to_normal = (random_val < self.random_prob) & (swir_state.mode == 0)
                     to_soft = (random_val >= self.random_prob) & (swir_state.mode == 1)
