@@ -576,24 +576,25 @@ class CODI(torch.nn.Module):
                 random_val = torch.rand(batch_size, device=device)
                 if step_idx == 0:
                     swir_state.mode = (random_val < self.random_prob).long()
-                elif self.baseline_mode == "alternating":
-                    # 新增：固定交替模式 S-L-S-L...
-                    # Step 0: S, Step 1: L, Step 2: S, Step 3: L, ...
-                    if step_idx % 2 == 0:
-                        swir_state.mode = torch.ones_like(swir_state.mode)   # S (显式)
-                    else:
-                        swir_state.mode = torch.zeros_like(swir_state.mode)  # L (隐式)
-                    
-                    return swir_state, \
-                        torch.zeros(batch_size, dtype=torch.bool, device=device), \
-                        torch.zeros(batch_size, dtype=torch.bool, device=device)
-    
                 else:
                     to_normal = (random_val < self.random_prob) & (swir_state.mode == 0)
                     to_soft = (random_val >= self.random_prob) & (swir_state.mode == 1)
                     swir_state.mode = torch.where(to_normal, torch.ones_like(swir_state.mode), swir_state.mode)
                     swir_state.mode = torch.where(to_soft, torch.zeros_like(swir_state.mode), swir_state.mode)
                 return swir_state, torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.bool, device=device)
+            
+            elif self.baseline_mode == "alternating":
+                # 新增：固定交替模式 S-L-S-L...
+                # Step 0: S, Step 1: L, Step 2: S, Step 3: L, ...
+                if step_idx % 2 == 0:
+                    swir_state.mode = torch.ones_like(swir_state.mode)   # S (显式)
+                else:
+                    swir_state.mode = torch.zeros_like(swir_state.mode)  # L (隐式)
+                
+                return swir_state, \
+                    torch.zeros(batch_size, dtype=torch.bool, device=device), \
+                    torch.zeros(batch_size, dtype=torch.bool, device=device)
+
             else:
                 return self.swir_controller.update(swir_state, cur_entropy, step=step_idx)
         
